@@ -27,16 +27,22 @@ use std::{
     ffi::CString,
     io, mem,
     os::fd::{AsRawFd, RawFd},
+    time::{Duration, Instant},
 };
 
-use tokio::io::unix::AsyncFd;
-use zenoh_protocol::transport::BatchSize;
+use tokio::{io::unix::AsyncFd, sync::Mutex};
 use zenoh_result::{bail, zerror, ZResult};
 
 use crate::{
-    frame::{self, Frame, RxDrop, RxFilter},
+    frame::{self, Frame, RxDrop},
     CanEndpoint,
 };
+
+/// How long a datagram may wait for room in the controller's transmit queue
+/// before it is dropped.
+const TX_QUEUE_PATIENCE: Duration = Duration::from_millis(250);
+/// How long to wait between tries when the transmit queue is full.
+const TX_QUEUE_RETRY: Duration = Duration::from_micros(500);
 
 /// An owned CAN socket descriptor.
 struct RawCan {
@@ -61,14 +67,12 @@ impl Drop for RawCan {
 /// The kernel clamps the request to `net.core.rmem_max` without telling anyone,
 /// and then reports back double what it stored, so the only honest thing to do
 /// is read the value back and say when it fell short.
-/// Why a classic interface is refused, and the two ways out.
+/// Why a classic interface is refused, and the way out.
 fn classic_refusal(device: &str) -> String {
     format!(
-        "This link is CAN FD only: a classic frame carries 7 bytes, and zenoh's JOIN -- a \
-         transport message it never fragments -- needs about 31, so no session could open. \
-         Enable FD on the interface (`ip link set {device} type can bitrate 500000 dbitrate \
-         2000000 fd on`; a vcan: `ip link set {device} mtu 72`), or use the ISO-TP link \
-         (`isotp/{device}#...`), which segments over classic frames."
+        "This link is CAN FD only. Enable FD on the interface (`ip link set {device} type can \
+         bitrate 500000 dbitrate 2000000 fd on`; a vcan: `ip link set {device} mtu 72`). A \
+         PCAN-USB (not FD) cannot do it: that adapter is classic CAN only."
     )
 }
 
@@ -146,23 +150,18 @@ fn set_rcvbuf(raw: &RawCan, requested: u32, device: &str) -> ZResult<()> {
 
 pub(crate) struct CanSocket {
     io: AsyncFd<RawCan>,
-    /// This peer's identifier -- its address on the bus. With priority bits in
-    /// play this is the peer field only, and the identifier actually
-    /// transmitted also carries the traffic class.
-    peer: u32,
-    /// Width of the traffic-class field, 0 when priority is not mapped onto
-    /// the identifier.
-    prio_bits: u8,
-    filter: RxFilter,
-    mtu: BatchSize,
+    /// This node, which is the source of every frame it sends.
+    node: u8,
+    /// The transfer id of the next datagram. Held while a datagram is sent,
+    /// so that two are never interleaved.
+    tid: Mutex<u8>,
 }
 
 impl CanSocket {
-    pub(crate) fn mtu(&self) -> BatchSize {
-        self.mtu
-    }
-
-    pub(crate) fn open(ep: &CanEndpoint) -> ZResult<CanSocket> {
+    /// Opens the interface, hearing only frames addressed to `rx_dst`: this node
+    /// for a unicast link, everybody ([`frame::NODE_BROADCAST`]) for a multicast
+    /// one.
+    pub(crate) fn open(ep: &CanEndpoint, rx_dst: u8) -> ZResult<CanSocket> {
         // Bit rates are set out of band on Linux (`ip link set can0 type can
         // bitrate ...`) and a virtual interface has none at all, so `bitrate`
         // and `dbitrate` are advisory here. CAN FD versus classic is the
@@ -197,12 +196,13 @@ impl CanSocket {
             );
         }
 
-        // Admit the whole band this bus segment reserves for zenoh; the read
-        // then drops our own frames. A mask of 0 matches everything, which is
-        // the default for a bus carrying nothing else.
+        // Have the kernel drop everything not addressed to us, so the CPU
+        // never sees it. The flag in the mask leaves out standard-identifier
+        // frames, which are someone else's.
+        let (filter_id, filter_mask) = frame::filter_for(rx_dst);
         let filter = libc::can_filter {
-            can_id: ep.filter_match,
-            can_mask: ep.filter_mask,
+            can_id: filter_id,
+            can_mask: filter_mask,
         };
         // SAFETY: `filter` outlives the call and its length is its own size.
         let rc = unsafe {
@@ -222,11 +222,8 @@ impl CanSocket {
             );
         }
 
-        // CAN FD is required, not preferred. A multicast session opens with a
-        // JOIN, a transport message zenoh never fragments, so it must fit one
-        // batch -- one frame here. Classic CAN leaves 7 bytes after the length
-        // prefix and the smallest JOIN is 13 (about 31 with a 16-byte ZID), so a
-        // classic interface could never open a session.
+        // CAN FD is required, not preferred. This link does not
+        // send or hear classic frames.
         //
         // `CAN_RAW_FD_FRAMES` alone does NOT detect one: the kernel accepts the
         // option on any CAN_RAW socket and checks the device only at send,
@@ -291,8 +288,6 @@ impl CanSocket {
             bail!("CAN: binding to {:?} failed: {e}", ep.device);
         }
 
-        let mtu = frame::FD_MTU;
-
         let io = AsyncFd::new(raw).map_err(|e| {
             zerror!(
                 "CAN: registering {:?} with the runtime failed: {e}",
@@ -302,30 +297,20 @@ impl CanSocket {
 
         Ok(CanSocket {
             io,
-            peer: ep.id,
-            prio_bits: ep.prio_bits,
-            filter: RxFilter {
-                own: ep.id,
-                match_: ep.filter_match,
-                mask: ep.filter_mask,
-                prio_bits: ep.prio_bits,
-            },
-            mtu,
+            node: ep.id,
+            tid: Mutex::new(0),
         })
     }
 
-    /// Write one datagram, which must fit one frame.
-    ///
-    /// `priority` is zenoh's own numbering, `Control` at 0 through `Background`
-    /// at 7. It selects the traffic class in the identifier when the endpoint
-    /// asked for priority bits, and is ignored otherwise.
-    ///
-    /// Returns the number of datagram bytes accepted. There is no partial write
-    /// to loop over: a datagram link writes one frame or it does not.
-    pub(crate) async fn send(&self, datagram: &[u8], priority: u8) -> ZResult<usize> {
-        let id = frame::tx_id(self.peer, self.prio_bits, priority);
-        let (f, wire) = frame::encode(id, datagram).map_err(|e| zerror!("CAN: {e}"))?;
-        let bytes = f.as_wire_bytes(wire);
+    /// This node's id, the source of every frame it sends.
+    pub(crate) fn node(&self) -> u8 {
+        self.node
+    }
+
+    /// Write one frame, waiting for the socket to be writable.
+    async fn write_frame(&self, f: &Frame) -> ZResult<()> {
+        let bytes = f.as_wire_bytes();
+        let deadline = Instant::now() + TX_QUEUE_PATIENCE;
 
         loop {
             let mut guard = self
@@ -335,12 +320,12 @@ impl CanSocket {
                 .map_err(|e| zerror!("CAN: waiting to write failed: {e}"))?;
 
             let attempt = guard.try_io(|inner| {
-                // SAFETY: `bytes` is a valid readable region of `wire` bytes.
+                // SAFETY: `bytes` is a valid readable region of its own length.
                 let n = unsafe {
                     libc::write(
                         inner.as_raw_fd(),
                         bytes.as_ptr() as *const libc::c_void,
-                        wire,
+                        bytes.len(),
                     )
                 };
                 if n < 0 {
@@ -355,30 +340,63 @@ impl CanSocket {
                 Err(_would_block) => continue,
                 Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Ok(Err(e)) if e.raw_os_error() == Some(libc::ENOBUFS) => {
-                    // The controller's transmit queue is full, which on a
-                    // shared bus means arbitration is being lost to higher
-                    // priority traffic. Dropping the datagram is correct for a
-                    // best-effort link; returning an error here would fail the
-                    // transport's TX task and tear down the whole session over
-                    // a transient condition.
-                    tracing::debug!(
-                        "CAN: transmit queue full, dropping a {}-byte datagram",
-                        datagram.len()
-                    );
-                    return Ok(datagram.len());
+                    // The controller's transmit queue is full, which on a bus
+                    // means frames are going out as fast as the bus takes them
+                    // (or arbitration is being lost to higher priority
+                    // traffic). A datagram is several frames, so dropping the
+                    // frame would waste the ones already sent: wait for room,
+                    // for a while. Raising `txqueuelen` on the interface helps.
+                    if Instant::now() >= deadline {
+                        return Err(zerror!("CAN: the transmit queue stayed full").into());
+                    }
+                    tokio::time::sleep(TX_QUEUE_RETRY).await;
                 }
                 Ok(Err(e)) => bail!("CAN: write failed: {e}"),
-                Ok(Ok(n)) if n == wire => return Ok(datagram.len()),
-                Ok(Ok(n)) => bail!("CAN: short write of {n} bytes, expected {wire}"),
+                Ok(Ok(n)) if n == bytes.len() => return Ok(()),
+                Ok(Ok(n)) => bail!("CAN: short write of {n} bytes, expected {}", bytes.len()),
             }
         }
     }
 
-    /// Read one datagram and report the identifier of the peer that sent it.
+    /// Write one datagram of up to [`frame::MTU`] bytes, in as many frames as it
+    /// takes, to `dst`. `priority` is zenoh's own numbering, `Control` at 0
+    /// through `Background` at 7, and goes in the identifier.
     ///
-    /// Frames this peer sent itself, and frames outside the configured band,
-    /// are skipped rather than returned.
-    pub(crate) async fn recv(&self, out: &mut [u8]) -> ZResult<(usize, u32)> {
+    /// Returns the number of datagram bytes accepted. A datagram that cannot be
+    /// sent because the bus is saturated is dropped, which is what a best-effort
+    /// link does; it is reported as sent so that it does not fail the transport
+    /// over a transient condition.
+    pub(crate) async fn send(&self, datagram: &[u8], dst: u8, priority: u8) -> ZResult<usize> {
+        let id = frame::make_id(priority, 0, dst, self.node);
+
+        // One transfer at a time. The frames of two datagrams under the same
+        // identifier would interleave and neither would reassemble, so the
+        // lock is held for the whole of one. It also hands out the transfer id.
+        let mut tid = self.tid.lock().await;
+        let frames = frame::encode(datagram, id, *tid).map_err(|e| zerror!("CAN: {e}"))?;
+        *tid = tid.wrapping_add(1) & frame::TAIL_TID_MASK;
+
+        tracing::trace!(
+            "CAN tx {} bytes in {} frames to node {dst}",
+            datagram.len(),
+            frames.len()
+        );
+        for f in &frames {
+            if let Err(e) = self.write_frame(f).await {
+                tracing::debug!(
+                    "CAN: dropping a {}-byte datagram, its frames did not all go: {e}",
+                    datagram.len()
+                );
+                break;
+            }
+        }
+        Ok(datagram.len())
+    }
+
+    /// Read one frame this node may use, and its identifier. Frames this node
+    /// sent itself, and ones that are not CAN FD data frames with an extended
+    /// identifier, are skipped rather than returned.
+    pub(crate) async fn recv(&self) -> ZResult<(u32, Frame)> {
         loop {
             let mut guard = self
                 .io
@@ -418,18 +436,38 @@ impl CanSocket {
                 bail!("CAN: the socket reported end of file");
             }
 
-            match frame::decode(&f, nread, &self.filter, out) {
-                Ok(delivered) => return Ok(delivered),
+            match frame::accept(&f, nread, self.node) {
+                Ok(id) => return Ok((id, f)),
                 // Expected on any shared bus, and on a loopback-enabled
                 // interface every transmission comes back to us.
-                Err(RxDrop::OwnFrame) | Err(RxDrop::Filtered { .. }) => continue,
+                Err(RxDrop::OwnFrame) | Err(RxDrop::NotAFrame { .. }) => continue,
                 // A malformed frame is worth a line, but not worth failing the
                 // link over: the bus is shared and anyone may put anything on it.
                 Err(drop) => {
-                    tracing::debug!("CAN: dropping a frame from {:#x}: {drop}", f.can_id);
+                    tracing::trace!("CAN: dropping a frame with id {:#x}: {drop}", f.can_id);
                     continue;
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Frame` stands in for `libc::canfd_frame`, so it has to be the same
+    /// shape.
+    #[test]
+    fn the_frame_matches_the_kernels() {
+        assert_eq!(mem::size_of::<Frame>(), mem::size_of::<libc::canfd_frame>());
+        assert_eq!(mem::size_of::<Frame>(), frame::CANFD_MTU_WIRE);
+        assert_eq!(
+            mem::align_of::<Frame>(),
+            mem::align_of::<libc::canfd_frame>()
+        );
+        assert_eq!(libc::CAN_EFF_FLAG, frame::CAN_EFF_FLAG);
+        assert_eq!(libc::CAN_EFF_MASK, frame::CAN_EFF_MASK);
+        assert_eq!(libc::CANFD_BRS as u8, frame::CANFD_BRS);
     }
 }

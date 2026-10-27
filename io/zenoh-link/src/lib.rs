@@ -23,7 +23,9 @@ use zenoh_config::Config;
 #[cfg(feature = "transport_can")]
 pub use zenoh_link_can as can;
 #[cfg(feature = "transport_can")]
-use zenoh_link_can::{CanLocatorInspector, LinkManagerMulticastCan, CAN_LOCATOR_PREFIX};
+use zenoh_link_can::{
+    CanLocatorInspector, LinkManagerMulticastCan, LinkManagerUnicastCan, CAN_LOCATOR_PREFIX,
+};
 pub use zenoh_link_commons::*;
 #[cfg(feature = "transport_quic")]
 pub use zenoh_link_quic as quic;
@@ -433,6 +435,8 @@ impl LinkManagerBuilderUnicast {
             LinkKind::Unixpipe => Ok(std::sync::Arc::new(LinkManagerUnicastPipe::new(_manager))),
             #[cfg(all(feature = "transport_vsock", target_os = "linux"))]
             LinkKind::Vscock => Ok(std::sync::Arc::new(LinkManagerUnicastVsock::new(_manager))),
+            #[cfg(feature = "transport_can")]
+            LinkKind::Can => Ok(std::sync::Arc::new(LinkManagerUnicastCan::new(_manager))),
             #[allow(unreachable_patterns)]
             _ => unreachable!(),
         }

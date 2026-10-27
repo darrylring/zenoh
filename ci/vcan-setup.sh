@@ -119,6 +119,9 @@ case "$ACTION" in
         fi
 
         have_dev || ip link add dev "$DEV" type vcan
+        # An MTU of 72, CANFD_MTU, is what makes a virtual interface CAN FD; the
+        # link refuses one that is not.
+        ip link set "$DEV" mtu 72
         ip link set up "$DEV"
 
         echo "[vcan-setup] $DEV ready"

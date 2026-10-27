@@ -12,42 +12,95 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
-//! The CAN link wire format.
+//! The CAN FD link wire format.
 //!
 //! This module deliberately contains no I/O and no platform types, so every
 //! rule below is a unit test that runs anywhere, with no `vcan0` and no root.
 //!
-//! One CAN frame carries one zenoh datagram. CAN FD payload lengths are
-//! quantised -- the DLC encodes 0..=8, 12, 16, 20, 24, 32, 48, 64 and nothing
-//! between -- so a 40-byte datagram travels in a 48-byte frame and the receiver
-//! cannot recover the true length from the frame alone. Byte 0 of every payload
-//! is therefore the datagram length and bytes 1..=N are the datagram.
+//! The format is fixed by the zenoh-pico implementation it interoperates with
+//! (`link/transport/can.h` and `can_codec.c`), and is not ours to change
+//! unilaterally. Pico also has a classic CAN mode with 8-byte frames; this link
+//! is CAN FD only, and drops classic frames it hears.
 //!
-//! The format is fixed by the zenoh-pico implementation it interoperates with,
-//! and is not ours to change unilaterally.
+//! # Identifier
+//!
+//! One 29-bit extended identifier layout serves unicast and multicast. CAN
+//! arbitrates on the identifier -- lowest wins -- so what goes in the high bits
+//! is what the bus treats as most urgent, and the low bits are what a
+//! controller's hardware filter selects on.
+//!
+//! ```text
+//!   28..26  priority   zenoh priority (0 = control ... 7 = background)
+//!   25..21  key id     the sender's ExprId for the topic, 0 = none
+//!   20..16  reserved   zero
+//!   15..8   destination node, 0xFF = every node (multicast)
+//!    7..0   source node
+//! ```
+//!
+//! # Segmentation
+//!
+//! A datagram of up to [`MTU`] bytes is far more than one frame, and is
+//! segmented here the way Cyphal/CAN does it: the **last** byte of every frame
+//! is a tail byte, and there is no flow control and no round trip.
+//!
+//! ```text
+//!   bit 7    start of transfer
+//!   bit 6    end of transfer
+//!   bit 5    toggle: 1 on the first frame, alternating
+//!   bit 4..0 transfer id
+//! ```
+//!
+//! The stream carried is `length prefix | datagram | zero padding | CRC`. The
+//! prefix is one byte below 128 and otherwise two (low seven bits first, bit 7
+//! meaning "another byte follows"), because CAN FD frame lengths are quantised
+//! (0..=8, 12, 16, 20, 24, 32, 48, 64) and the last frame is padded. A transfer
+//! that needs more than one frame ends with a CRC-16/CCITT-FALSE over
+//! everything before it, padding included, most significant byte first. A
+//! datagram that fits a single frame has no CRC.
 
 use core::fmt;
 
 use zenoh_protocol::transport::BatchSize;
 
-/// Byte 0 of the frame payload carries the true datagram length.
-pub(crate) const LEN_PREFIX: usize = 1;
+pub(crate) const SRC_SHIFT: u32 = 0;
+pub(crate) const DST_SHIFT: u32 = 8;
+pub(crate) const KEY_SHIFT: u32 = 21;
+pub(crate) const PRIO_SHIFT: u32 = 26;
 
-/// `CANFD_MAX_DLEN`.
+pub(crate) const NODE_MASK: u32 = 0xFF;
+/// The destination of multicast frames.
+pub(crate) const NODE_BROADCAST: u8 = 0xFF;
+const KEY_MASK: u32 = 0x1F;
+const PRIO_MASK: u32 = 0x07;
+
+/// The highest node id a link may use: 0xFF is the broadcast address.
+pub(crate) const NODE_MAX: u8 = 0xFE;
+
+/// zenoh's `Priority::Data`, which is what pico sends everything at.
+pub(crate) const PRIO_DEFAULT: u8 = 5;
+
+pub(crate) const TAIL_SOT: u8 = 0x80;
+pub(crate) const TAIL_EOT: u8 = 0x40;
+pub(crate) const TAIL_TOGGLE: u8 = 0x20;
+pub(crate) const TAIL_TID_MASK: u8 = 0x1F;
+
+/// `CANFD_MAX_DLEN`, the biggest frame there is.
 pub(crate) const FD_MAX_DLEN: usize = 64;
-/// Frame lengths 0..=8 are all representable; above that only the DLC steps are.
-const CONTIGUOUS_DLEN: usize = 8;
 
-/// Usable datagram bytes once the length prefix is subtracted.
+/// The largest datagram. Every peer must agree on it.
+pub(crate) const MTU: BatchSize = 4095;
+
+/// The most a transfer can occupy on the wire: length prefix, datagram, padding
+/// and CRC.
+const MAX_TRANSFER: usize = MTU as usize + 2 + 16 + 2;
+
+/// How many transfers one receiver reassembles at once.
 ///
-/// This link is **CAN FD only**. On classic CAN a frame carries 8 bytes, and
-/// the length prefix is not needed there because the DLC encodes 0..=8 exactly,
-/// so the payload is 8. That is still not enough: a `Join` is 33 bytes at its
-/// smallest, and transport messages are never fragmented -- they must fit one
-/// batch whole or the session cannot open. A classic link is not a slower link,
-/// it is one that never establishes. Refusing it at open beats shipping a path
-/// that can only ever hang.
-pub(crate) const FD_MTU: BatchSize = (FD_MAX_DLEN - LEN_PREFIX) as BatchSize; // 63
+/// A transfer is keyed by (priority, key, source), so one node's urgent message
+/// can arrive in the middle of its own bulk one. A unicast link hears one node;
+/// a multicast one hears everybody, so it gets more.
+pub(crate) const RX_SESSIONS_UNICAST: usize = 4;
+pub(crate) const RX_SESSIONS_MULTICAST: usize = 16;
 
 /// `sizeof(struct canfd_frame)`, which is the read and write size the kernel
 /// uses for CAN FD. A 16-byte read is a classic frame and is not ours.
@@ -55,76 +108,57 @@ pub(crate) const CANFD_MTU_WIRE: usize = 72;
 
 /// `CANFD_BRS` -- use the fast data phase.
 pub(crate) const CANFD_BRS: u8 = 0x01;
+/// `CANFD_FDF` -- this is a CAN FD frame, as opposed to a classic one. Newer
+/// kernels want it on every frame written with a `canfd_frame`.
+pub(crate) const CANFD_FDF: u8 = 0x04;
 
-pub(crate) const CAN_SFF_MASK: u32 = 0x0000_07FF;
+/// `CAN_EFF_FLAG`, which marks an identifier as 29-bit.
+pub(crate) const CAN_EFF_FLAG: u32 = 0x8000_0000;
 pub(crate) const CAN_EFF_MASK: u32 = 0x1FFF_FFFF;
+const CAN_RTR_FLAG: u32 = 0x4000_0000;
+const CAN_ERR_FLAG: u32 = 0x2000_0000;
 
 /// The representable CAN FD frame lengths above 8.
-const FD_DLC_STEPS: [u8; 7] = [12, 16, 20, 24, 32, 48, 64];
+const FD_DLC_STEPS: [usize; 7] = [12, 16, 20, 24, 32, 48, 64];
 
-/// Identifiers are 11 bits, so this is the whole address space to divide up.
-pub(crate) const ID_BITS: u8 = 11;
-
-/// zenoh has 8 priorities, so a fully priority-major layout costs 3 bits.
-pub(crate) const PRIO_BITS_MAX: u8 = 3;
-
-/// The mask that recovers a peer's identity from a frame identifier.
-///
-/// With no priority bits the identifier *is* the peer, and the mask matches
-/// what zenoh-pico applies, so the two implementations agree. With `n` priority
-/// bits the top `n` bits are the traffic class and only the rest identify the
-/// peer -- otherwise one peer would look like `2^n` different peers, one per
-/// priority it happens to transmit at.
-pub(crate) const fn peer_mask(prio_bits: u8) -> u32 {
-    if prio_bits == 0 {
-        CAN_EFF_MASK
-    } else {
-        (1u32 << (ID_BITS - prio_bits)) - 1
-    }
+/// The identifier a frame goes out under.
+pub(crate) const fn make_id(prio: u8, key: u8, dst: u8, src: u8) -> u32 {
+    ((prio as u32 & PRIO_MASK) << PRIO_SHIFT)
+        | ((key as u32 & KEY_MASK) << KEY_SHIFT)
+        | ((dst as u32 & NODE_MASK) << DST_SHIFT)
+        | ((src as u32 & NODE_MASK) << SRC_SHIFT)
 }
 
-/// The largest peer identifier expressible alongside `prio_bits` class bits.
-pub(crate) const fn max_peer_id(prio_bits: u8) -> u32 {
-    (1u32 << (ID_BITS - prio_bits)) - 1
+pub(crate) const fn id_src(id: u32) -> u8 {
+    ((id >> SRC_SHIFT) & NODE_MASK) as u8
 }
 
-/// The identifier `peer` transmits on for a batch of the given zenoh priority.
-///
-/// The class occupies the **most significant** bits, so it dominates
-/// arbitration: a lower identifier wins the bus, and zenoh numbers its
-/// priorities with `Control` at 0 and `Background` at 7, so the two orderings
-/// already agree and nothing has to be inverted.
-///
-/// With fewer than 3 class bits the 8 priorities are folded onto `2^n` classes
-/// by dropping the low bits, which keeps the ordering and merges neighbours.
-pub(crate) fn tx_id(peer: u32, prio_bits: u8, priority: u8) -> u32 {
-    if prio_bits == 0 {
-        return peer;
-    }
-    let class = (priority >> (PRIO_BITS_MAX - prio_bits)) as u32;
-    (class << (ID_BITS - prio_bits)) | peer
+#[cfg(test)]
+pub(crate) const fn id_dst(id: u32) -> u8 {
+    ((id >> DST_SHIFT) & NODE_MASK) as u8
 }
 
-/// How the receiver decides which frames are its own, which are in band, and
-/// which peer sent one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RxFilter {
-    /// This peer's identifier, in the peer field.
-    pub(crate) own: u32,
-    pub(crate) match_: u32,
-    pub(crate) mask: u32,
-    pub(crate) prio_bits: u8,
+/// What a hardware filter must match to receive frames addressed to `dst`:
+/// the identifier, and the mask that selects the destination field (and the
+/// extended-identifier flag, so standard frames never match).
+pub(crate) const fn filter_for(dst: u8) -> (u32, u32) {
+    (
+        ((dst as u32) << DST_SHIFT) | CAN_EFF_FLAG,
+        (NODE_MASK << DST_SHIFT) | CAN_EFF_FLAG,
+    )
+}
+
+/// The identifier with the destination removed, which names a transfer: the
+/// frames of one datagram share it, whoever they were addressed to.
+const fn transfer_key(id: u32) -> u32 {
+    id & !(NODE_MASK << DST_SHIFT)
 }
 
 /// `struct canfd_frame` from `<linux/can.h>`.
 ///
 /// Declared here rather than taken from `libc` because `libc`'s version keeps
 /// its reserved fields private, so it cannot be constructed. The layout is
-/// asserted against `libc`'s in [`assert_layout_matches_libc`] on Linux.
-///
-/// In classic mode only the first [`CAN_MTU_WIRE`] bytes are written, and they
-/// overlay `struct can_frame` exactly: `len` lands on `can_dlc`, `flags` -- zero
-/// in classic mode -- lands on `__pad`, and `res1` lands on `len8_dlc`.
+/// asserted against `libc`'s in `sys.rs` on Linux.
 #[repr(C, align(8))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Frame {
@@ -148,30 +182,39 @@ impl Frame {
         }
     }
 
-    /// The first `wire` bytes of the frame, as they go to `write(2)`.
+    /// The frame as the kernel writes and reads it.
     ///
-    /// `Frame` is `repr(C)` with no interior padding -- 4 + 1 + 1 + 1 + 1 + 64 is
-    /// exactly 72, and 72 is a multiple of the 8-byte alignment -- so every byte
-    /// of the struct is an initialised field byte.
-    pub(crate) fn as_wire_bytes(&self, wire: usize) -> &[u8] {
-        debug_assert!(wire <= core::mem::size_of::<Frame>());
+    /// `Frame` is `repr(C)` with no interior padding -- 4 + 1 + 1 + 1 + 1 + 64
+    /// is exactly 72, and 72 is a multiple of the 8-byte alignment -- so every
+    /// byte of the struct is an initialised field byte.
+    pub(crate) fn as_wire_bytes(&self) -> &[u8] {
         // SAFETY: `Frame` is `repr(C)` and padding-free, so it is valid to read
-        // as a byte slice, and `wire` is bounded by its size.
-        unsafe { core::slice::from_raw_parts(self as *const Frame as *const u8, wire) }
+        // as a byte slice.
+        unsafe { core::slice::from_raw_parts(self as *const Frame as *const u8, CANFD_MTU_WIRE) }
+    }
+
+    /// The frame's payload, tail byte included.
+    pub(crate) fn payload(&self) -> &[u8] {
+        &self.data[..(self.len as usize).min(FD_MAX_DLEN)]
+    }
+
+    /// The tail byte, if there is a payload at all.
+    pub(crate) fn tail(&self) -> Option<u8> {
+        self.payload().last().copied()
+    }
+
+    /// Whether this frame begins a transfer.
+    pub(crate) fn is_start(&self) -> bool {
+        self.tail().is_some_and(|t| t & TAIL_SOT != 0)
     }
 }
 
 /// Refusal reasons for [`encode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TxError {
-    /// The datagram does not fit one frame. zenoh's transport fragments to the
-    /// link MTU before the link is called, so this is a bug at the call site
-    /// rather than an expected runtime condition.
+    /// The datagram is bigger than [`MTU`]. zenoh's transport never hands the
+    /// link more than that, so this is a bug at the call site.
     TooLarge { len: usize },
-    /// Only 11-bit identifiers are expressible: the sender never sets
-    /// `CAN_EFF_FLAG`, so a larger value would silently become a different
-    /// identifier on the wire.
-    IdentifierTooWide { id: u32 },
 }
 
 impl fmt::Display for TxError {
@@ -180,35 +223,293 @@ impl fmt::Display for TxError {
             TxError::TooLarge { len } => {
                 write!(
                     f,
-                    "datagram of {len} bytes exceeds the CAN link MTU of {FD_MTU}"
+                    "datagram of {len} bytes exceeds the CAN link MTU of {MTU}"
                 )
             }
-            TxError::IdentifierTooWide { id } => write!(
-                f,
-                "CAN identifier {id:#x} exceeds the 11-bit range (max {CAN_SFF_MASK:#x}); \
-                 extended identifiers are not part of this wire format"
-            ),
         }
     }
 }
 
-/// Why a received frame was not delivered to the transport.
+/// CRC-16/CCITT-FALSE, one byte at a time: initial value `0xFFFF`, polynomial
+/// `0x1021`, no reflection.
+fn crc16(mut crc: u16, b: u8) -> u16 {
+    crc ^= (b as u16) << 8;
+    for _ in 0..8 {
+        crc = if crc & 0x8000 != 0 {
+            (crc << 1) ^ 0x1021
+        } else {
+            crc << 1
+        };
+    }
+    crc
+}
+
+/// The smallest legal frame length that holds `n` bytes.
+fn frame_len(n: usize) -> usize {
+    if n <= 8 {
+        return n;
+    }
+    FD_DLC_STEPS
+        .iter()
+        .copied()
+        .find(|&step| n <= step)
+        .unwrap_or(FD_MAX_DLEN)
+}
+
+/// The length prefix: one byte below 128, otherwise two.
+fn put_len(len: usize) -> ([u8; 2], usize) {
+    if len < 0x80 {
+        ([len as u8, 0], 1)
+    } else {
+        ([0x80 | (len & 0x7F) as u8, (len >> 7) as u8], 2)
+    }
+}
+
+/// Returns the length and the number of bytes it took, or `None` if malformed.
+fn get_len(src: &[u8]) -> Option<(usize, usize)> {
+    let first = *src.first()?;
+    if first & 0x80 == 0 {
+        return Some((first as usize, 1));
+    }
+    let second = *src.get(1)?;
+    if second >= 0x80 {
+        return None;
+    }
+    Some((((first & 0x7F) as usize) | ((second as usize) << 7), 2))
+}
+
+/// Segment `datagram` into the frames that carry it.
+///
+/// `id` is the 29-bit identifier every frame goes out under and `tid` the
+/// transfer id, of which only the low 5 bits are used. Every frame is marked
+/// as an extended-identifier one, and asks for the fast data phase.
+pub(crate) fn encode(datagram: &[u8], id: u32, tid: u8) -> Result<Vec<Frame>, TxError> {
+    if datagram.len() > MTU as usize {
+        return Err(TxError::TooLarge {
+            len: datagram.len(),
+        });
+    }
+
+    let (prefix, plen) = put_len(datagram.len());
+    let total = plen + datagram.len();
+    let cap = FD_MAX_DLEN - 1;
+    let tid = tid & TAIL_TID_MASK;
+
+    // The stream is prefix | datagram | padding | crc, and the crc exists only
+    // when it spans several frames. Padding is zeros, sized so that the last
+    // frame is a legal length.
+    let (pad, crc_len) = if total < FD_MAX_DLEN {
+        (frame_len(total + 1) - (total + 1), 0)
+    } else {
+        let l0 = total + 2;
+        let last = l0 - (l0.div_ceil(cap) - 1) * cap;
+        (frame_len(last + 1) - (last + 1), 2)
+    };
+    let body = total + pad;
+    let stream = body + crc_len;
+
+    let byte_at = |p: usize, crc: u16| -> u8 {
+        if p < plen {
+            prefix[p]
+        } else if p < total {
+            datagram[p - plen]
+        } else if p < body {
+            0
+        } else if p == body {
+            (crc >> 8) as u8
+        } else {
+            (crc & 0xFF) as u8
+        }
+    };
+
+    let mut crc = 0xFFFFu16;
+    if crc_len != 0 {
+        for p in 0..body {
+            crc = crc16(crc, byte_at(p, 0));
+        }
+    }
+
+    let mut frames = Vec::with_capacity(stream.div_ceil(cap));
+    let mut toggle = TAIL_TOGGLE;
+    let mut pos = 0;
+    while pos < stream {
+        let n = (stream - pos).min(cap);
+        let mut frame = Frame::zeroed();
+        frame.can_id = id | CAN_EFF_FLAG;
+        for i in 0..n {
+            frame.data[i] = byte_at(pos + i, crc);
+        }
+        let mut tail = toggle | tid;
+        if pos == 0 {
+            tail |= TAIL_SOT;
+        }
+        if pos + n == stream {
+            tail |= TAIL_EOT;
+        }
+        frame.data[n] = tail;
+        frame.len = (n + 1) as u8;
+        frame.flags = CANFD_BRS | CANFD_FDF;
+        frames.push(frame);
+
+        pos += n;
+        toggle ^= TAIL_TOGGLE;
+    }
+    Ok(frames)
+}
+
+/// Take the datagram out of a finished stream, or `None` if it does not hold
+/// one that fits `out`.
+fn deliver(stream: &[u8], out: &mut [u8]) -> Option<usize> {
+    let (dlen, plen) = get_len(stream)?;
+    if dlen > stream.len() - plen || dlen > out.len() {
+        return None;
+    }
+    out[..dlen].copy_from_slice(&stream[plen..plen + dlen]);
+    Some(dlen)
+}
+
+#[derive(Debug)]
+struct Session {
+    key: u32,
+    /// For evicting the stalest slot.
+    age: u64,
+    tid: u8,
+    /// The toggle bit the next frame must carry.
+    toggle: u8,
+    buf: Vec<u8>,
+}
+
+/// Reassembles the datagrams in the frames a receiver hears.
+#[derive(Debug)]
+pub(crate) struct Reassembler {
+    max_sessions: usize,
+    sessions: Vec<Session>,
+    clock: u64,
+}
+
+impl Reassembler {
+    pub(crate) fn new(max_sessions: usize) -> Self {
+        Reassembler {
+            max_sessions,
+            sessions: Vec::new(),
+            clock: 0,
+        }
+    }
+
+    fn position(&self, key: u32) -> Option<usize> {
+        self.sessions.iter().position(|s| s.key == key)
+    }
+
+    /// Feed one received frame. Returns the datagram's length once `out` holds
+    /// it, or `None` when more frames are needed or the frame was dropped as
+    /// stale or corrupt.
+    ///
+    /// The rules are applied in the same order as the zenoh-pico receiver, so
+    /// the two implementations drop the same frames for the same reasons.
+    pub(crate) fn decode(&mut self, id: u32, payload: &[u8], out: &mut [u8]) -> Option<usize> {
+        let (&tail, data) = payload.split_last()?;
+        let sot = tail & TAIL_SOT != 0;
+        let eot = tail & TAIL_EOT != 0;
+        let toggle = tail & TAIL_TOGGLE;
+        let tid = tail & TAIL_TID_MASK;
+        let key = transfer_key(id);
+
+        if sot && eot {
+            // A single frame. A transfer in flight under the same key is
+            // abandoned.
+            if let Some(i) = self.position(key) {
+                self.sessions.swap_remove(i);
+            }
+            return if toggle != 0 {
+                deliver(data, out)
+            } else {
+                None
+            };
+        }
+
+        let index = if sot {
+            if toggle == 0 {
+                return None;
+            }
+            // A start replaces the transfer under its key, else takes a free
+            // slot, else evicts the stalest one.
+            let index = match self.position(key) {
+                Some(i) => i,
+                None if self.sessions.len() < self.max_sessions => {
+                    self.sessions.push(Session {
+                        key,
+                        age: 0,
+                        tid,
+                        toggle: TAIL_TOGGLE,
+                        buf: Vec::new(),
+                    });
+                    self.sessions.len() - 1
+                }
+                None => self
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, s)| s.age)
+                    .map(|(i, _)| i)?,
+            };
+            let s = &mut self.sessions[index];
+            s.key = key;
+            s.tid = tid;
+            s.toggle = TAIL_TOGGLE;
+            s.buf.clear();
+            index
+        } else {
+            match self.position(key) {
+                Some(i) if self.sessions[i].tid == tid && self.sessions[i].toggle == toggle => i,
+                // A frame went missing, or this is the tail of something we
+                // never saw the start of. Drop the transfer; the sender's next
+                // one starts clean.
+                Some(i) => {
+                    self.sessions.swap_remove(i);
+                    return None;
+                }
+                None => return None,
+            }
+        };
+
+        self.clock += 1;
+        let s = &mut self.sessions[index];
+        if s.buf.len() + data.len() > MAX_TRANSFER {
+            self.sessions.swap_remove(index);
+            return None;
+        }
+        s.buf.extend_from_slice(data);
+        s.toggle ^= TAIL_TOGGLE;
+        s.age = self.clock;
+
+        if !eot {
+            return None;
+        }
+        let s = self.sessions.swap_remove(index);
+        if s.buf.len() < 3 {
+            return None;
+        }
+        let crc = s.buf.iter().fold(0xFFFFu16, |crc, &b| crc16(crc, b));
+        if crc != 0 {
+            tracing::debug!("CAN: transfer from node {} failed its CRC", id_src(id));
+            return None;
+        }
+        deliver(&s.buf[..s.buf.len() - 2], out)
+    }
+}
+
+/// Why a frame read from the socket was not handed to the link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RxDrop {
     /// Not a `canfd_frame`: a classic frame from some other device on the bus,
     /// a runt, or an error frame.
     NotAFrame { nread: usize },
+    /// A standard-identifier, remote or error frame. Not ours.
+    NotExtended,
     /// Our own transmission, heard back on a loopback-enabled interface.
     OwnFrame,
-    /// Outside the identifier band this bus reserves for zenoh.
-    Filtered { sender: u32 },
-    /// No room for even the length prefix.
-    NoLengthByte,
-    /// The length byte disagrees with the frame length.
-    BadLength { declared: usize, available: usize },
-    /// The transport's buffer cannot hold the datagram. Dropping beats handing
-    /// back a truncated datagram that would deserialise as garbage.
-    BufferTooSmall { needed: usize, have: usize },
+    /// A frame whose payload length is not a legal CAN FD length, or is empty.
+    BadLength,
 }
 
 impl fmt::Display for RxDrop {
@@ -217,647 +518,330 @@ impl fmt::Display for RxDrop {
             RxDrop::NotAFrame { nread } => {
                 write!(f, "read of {nread} bytes is not a CAN FD frame")
             }
+            RxDrop::NotExtended => write!(f, "not an extended-identifier data frame"),
             RxDrop::OwnFrame => write!(f, "own transmission"),
-            RxDrop::Filtered { sender } => write!(f, "identifier {sender:#x} outside the band"),
-            RxDrop::NoLengthByte => write!(f, "frame carries no length byte"),
-            RxDrop::BadLength {
-                declared,
-                available,
-            } => write!(
-                f,
-                "length byte declares {declared} bytes but only {available} are present"
-            ),
-            RxDrop::BufferTooSmall { needed, have } => {
-                write!(
-                    f,
-                    "datagram of {needed} bytes does not fit a {have}-byte buffer"
-                )
-            }
+            RxDrop::BadLength => write!(f, "empty or oversized payload"),
         }
     }
 }
 
-/// Round a payload length up to the next representable CAN FD frame length.
-///
-/// Below 9 bytes every length is representable and the payload is used as is;
-/// above it only the DLC steps exist.
-pub(crate) fn fd_frame_len(payload: usize) -> u8 {
-    if payload <= CONTIGUOUS_DLEN {
-        return payload as u8;
-    }
-    for step in FD_DLC_STEPS {
-        if payload <= step as usize {
-            return step;
-        }
-    }
-    // Unreachable for any payload <= 64, which `encode` has already enforced.
-    FD_MAX_DLEN as u8
-}
-
-/// Build the frame carrying `datagram`, and the number of bytes to write.
-pub(crate) fn encode(id: u32, datagram: &[u8]) -> Result<(Frame, usize), TxError> {
-    if id > CAN_SFF_MASK {
-        return Err(TxError::IdentifierTooWide { id });
-    }
-    if datagram.len() > FD_MTU as usize {
-        return Err(TxError::TooLarge {
-            len: datagram.len(),
-        });
-    }
-
-    let mut frame = Frame::zeroed();
-    frame.can_id = id;
-    frame.data[0] = datagram.len() as u8;
-    frame.data[LEN_PREFIX..LEN_PREFIX + datagram.len()].copy_from_slice(datagram);
-
-    // The bit-rate switch is requested for every frame, not only the long ones:
-    // the data phase is where the rate gain is.
-    frame.flags = CANFD_BRS;
-    frame.len = fd_frame_len(datagram.len() + LEN_PREFIX);
-
-    Ok((frame, CANFD_MTU_WIRE))
-}
-
-/// Decide what a received frame is, and copy out the datagram if it is one.
-///
-/// The rules are applied in the same order as the zenoh-pico receiver, so the
-/// two implementations drop the same frames for the same reasons.
-pub(crate) fn decode(
-    frame: &Frame,
-    nread: usize,
-    filter: &RxFilter,
-    out: &mut [u8],
-) -> Result<(usize, u32), RxDrop> {
+/// Decide whether a frame read from the socket is one a link may use. On
+/// success, its identifier has the flag bits removed.
+pub(crate) fn accept(frame: &Frame, nread: usize, own: u8) -> Result<u32, RxDrop> {
     // Only CAN FD. A 16-byte read is a classic frame, which on a shared bus is
     // some other device's traffic and never ours.
     if nread != CANFD_MTU_WIRE {
         return Err(RxDrop::NotAFrame { nread });
     }
-
-    // The peer field, not the whole identifier: with priority bits in play the
-    // same peer transmits under several identifiers and they must all resolve
-    // to one address.
-    let sender = frame.can_id & peer_mask(filter.prio_bits);
-    if sender == filter.own {
+    let id = frame.can_id;
+    if id & CAN_EFF_FLAG == 0 || id & (CAN_RTR_FLAG | CAN_ERR_FLAG) != 0 {
+        return Err(RxDrop::NotExtended);
+    }
+    let id = id & CAN_EFF_MASK;
+    if id_src(id) == own {
         return Err(RxDrop::OwnFrame);
     }
-    if filter.mask != 0 && (sender & filter.mask) != filter.match_ {
-        return Err(RxDrop::Filtered { sender });
+    if frame.len == 0 || frame.len as usize > FD_MAX_DLEN {
+        return Err(RxDrop::BadLength);
     }
-
-    let frame_len = frame.len as usize;
-    if frame_len < LEN_PREFIX {
-        return Err(RxDrop::NoLengthByte);
-    }
-
-    let declared = frame.data[0] as usize;
-    let available = frame_len - LEN_PREFIX;
-    if declared > available {
-        return Err(RxDrop::BadLength {
-            declared,
-            available,
-        });
-    }
-    if declared > out.len() {
-        return Err(RxDrop::BufferTooSmall {
-            needed: declared,
-            have: out.len(),
-        });
-    }
-
-    out[..declared].copy_from_slice(&frame.data[LEN_PREFIX..LEN_PREFIX + declared]);
-    Ok((declared, sender))
-}
-
-/// A receive filter with no priority bits, which is the wire zenoh-pico speaks.
-#[cfg(test)]
-fn f(own: u32, match_: u32, mask: u32) -> RxFilter {
-    RxFilter {
-        own,
-        match_,
-        mask,
-        prio_bits: 0,
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
-#[test]
-fn assert_layout_matches_libc() {
-    assert_eq!(
-        core::mem::size_of::<Frame>(),
-        core::mem::size_of::<libc::canfd_frame>()
-    );
-    assert_eq!(
-        core::mem::align_of::<Frame>(),
-        core::mem::align_of::<libc::canfd_frame>()
-    );
-    assert_eq!(core::mem::size_of::<Frame>(), CANFD_MTU_WIRE);
-    assert_eq!(libc::CANFD_BRS as u8, CANFD_BRS);
-    assert_eq!(libc::CAN_SFF_MASK, CAN_SFF_MASK);
-    assert_eq!(libc::CAN_EFF_MASK, CAN_EFF_MASK);
+    Ok(id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn datagram(len: usize) -> Vec<u8> {
-        (0..len).map(|i| (i + 1) as u8).collect()
+    fn datagram(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i * 7 + 1) as u8).collect()
+    }
+
+    fn roundtrip(n: usize) {
+        let d = datagram(n);
+        let id = make_id(3, 0, 0xFF, 0x12);
+        let frames = encode(&d, id, 9).unwrap();
+        let mut rx = Reassembler::new(4);
+        let mut out = vec![0u8; MTU as usize];
+        let mut got = None;
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(f.can_id, id | CAN_EFF_FLAG);
+            assert!(
+                f.len as usize <= 8 || FD_DLC_STEPS.contains(&(f.len as usize)),
+                "illegal frame length {} for a {n}-byte datagram",
+                f.len
+            );
+            let r = rx.decode(f.can_id, f.payload(), &mut out);
+            if i + 1 == frames.len() {
+                got = r;
+            } else {
+                assert_eq!(r, None, "a datagram of {n} bytes finished early");
+            }
+        }
+        assert_eq!(got, Some(n), "{n} bytes");
+        assert_eq!(&out[..n], &d[..]);
     }
 
     #[test]
-    fn the_mtu_is_the_frame_size_less_the_prefix() {
-        assert_eq!(FD_MTU, 63);
-    }
-
-    /// Every DLC boundary. The left column is the
-    /// datagram length; the right is the resulting `frame.len`, which includes
-    /// the length prefix.
-    #[test]
-    fn fd_dlc_steps() {
-        let expected: &[(usize, u8)] = &[
-            (0, 1),
-            (7, 8),
-            // payload 9 is past the last contiguous length, so it rounds
-            (8, 12),
-            (11, 12),
-            (12, 16),
-            (15, 16),
-            (16, 20),
-            (19, 20),
-            (20, 24),
-            (23, 24),
-            (24, 32),
-            (31, 32),
-            (32, 48),
-            (47, 48),
-            (48, 64),
-            (62, 64),
-            (63, 64),
-        ];
-        for (len, frame_len) in expected {
-            let (frame, wire) = encode(0x100, &datagram(*len)).unwrap();
-            assert_eq!(frame.len, *frame_len, "datagram of {len} bytes");
-            assert_eq!(wire, CANFD_MTU_WIRE);
+    fn every_size_round_trips() {
+        for n in 0..=MTU as usize {
+            roundtrip(n);
         }
     }
 
     #[test]
-    fn brs_is_set_on_every_frame_including_short_ones() {
-        for len in [0usize, 1, 7, 8, 63] {
-            let (frame, _) = encode(0x100, &datagram(len)).unwrap();
-            assert_eq!(frame.flags, CANFD_BRS, "datagram of {len} bytes");
+    fn small_datagrams_are_one_frame_without_a_crc() {
+        let f = encode(&datagram(10), 0, 0).unwrap();
+        assert_eq!(f.len(), 1);
+        // prefix + 10 bytes + tail = 12, a legal length, so no padding
+        assert_eq!(f[0].len, 12);
+        assert_eq!(f[0].data[0], 10);
+        assert_eq!(f[0].data[11], TAIL_SOT | TAIL_EOT | TAIL_TOGGLE);
+    }
+
+    #[test]
+    fn padding_makes_the_last_frame_a_legal_length() {
+        // prefix + 9 bytes + tail = 11, which is not a CAN FD length
+        let f = encode(&datagram(9), 0, 0).unwrap();
+        assert_eq!(f[0].len, 12);
+        assert_eq!(f[0].data[10], 0, "padding is zeros");
+    }
+
+    #[test]
+    fn a_long_prefix_is_two_bytes_low_seven_bits_first() {
+        let f = encode(&datagram(300), 0, 0).unwrap();
+        assert_eq!(f[0].data[0], 0x80 | (300 & 0x7F) as u8);
+        assert_eq!(f[0].data[1], (300 >> 7) as u8);
+    }
+
+    #[test]
+    fn the_toggle_alternates_and_the_ends_are_marked() {
+        let f = encode(&datagram(400), 0, 0x1F).unwrap();
+        assert!(f.len() > 2);
+        for (i, frame) in f.iter().enumerate() {
+            let tail = frame.tail().unwrap();
+            assert_eq!(tail & TAIL_TID_MASK, 0x1F);
+            assert_eq!(tail & TAIL_TOGGLE != 0, i % 2 == 0, "frame {i}");
+            assert_eq!(tail & TAIL_SOT != 0, i == 0);
+            assert_eq!(tail & TAIL_EOT != 0, i + 1 == f.len());
         }
     }
 
     #[test]
-    fn over_mtu_is_refused() {
+    fn the_transfer_id_wraps_at_five_bits() {
+        let f = encode(&datagram(5), 0, 0x23).unwrap();
+        assert_eq!(f[0].tail().unwrap() & TAIL_TID_MASK, 0x03);
+    }
+
+    #[test]
+    fn a_datagram_over_the_mtu_is_refused() {
         assert_eq!(
-            encode(0x100, &datagram(64)),
-            Err(TxError::TooLarge { len: 64 })
+            encode(&datagram(MTU as usize + 1), 0, 0),
+            Err(TxError::TooLarge {
+                len: MTU as usize + 1
+            })
         );
-        assert!(encode(0x100, &datagram(63)).is_ok());
     }
 
-    /// A classic frame is a 16-byte read. This link does not speak classic, so
-    /// such a frame is another device's traffic and must be dropped rather than
-    /// decoded -- the bytes would parse, and mean nothing.
+    /// Without the flag the kernel sends a standard frame with the identifier
+    /// cut to 11 bits, and nothing zenoh-pico filters on would match.
+    #[test]
+    fn every_frame_is_an_extended_identifier_frame() {
+        for f in encode(&datagram(500), make_id(5, 0, 2, 1), 0).unwrap() {
+            assert_ne!(f.can_id & CAN_EFF_FLAG, 0);
+            assert_eq!(f.can_id & CAN_EFF_MASK, make_id(5, 0, 2, 1));
+        }
+    }
+
+    #[test]
+    fn every_frame_asks_for_the_fast_data_phase() {
+        for f in encode(&datagram(500), 0, 0).unwrap() {
+            assert_eq!(f.flags, CANFD_BRS | CANFD_FDF);
+        }
+    }
+
+    /// The CRC covers the padding too, and a flipped bit anywhere fails it.
+    #[test]
+    fn a_corrupt_transfer_is_dropped() {
+        let d = datagram(300);
+        let mut frames = encode(&d, 0x100, 0).unwrap();
+        frames[2].data[5] ^= 0x04;
+        let mut rx = Reassembler::new(4);
+        let mut out = vec![0u8; MTU as usize];
+        for f in &frames {
+            assert_eq!(rx.decode(f.can_id, f.payload(), &mut out), None);
+        }
+    }
+
+    #[test]
+    fn a_lost_frame_drops_the_transfer_and_the_next_one_is_fine() {
+        let id = make_id(5, 0, 1, 2);
+        let mut frames = encode(&datagram(300), id, 0).unwrap();
+        frames.remove(2);
+        let mut rx = Reassembler::new(4);
+        let mut out = vec![0u8; MTU as usize];
+        for f in &frames {
+            assert_eq!(rx.decode(f.can_id, f.payload(), &mut out), None);
+        }
+        for f in encode(&datagram(300), id, 1).unwrap() {
+            let r = rx.decode(f.can_id, f.payload(), &mut out);
+            if f.tail().unwrap() & TAIL_EOT != 0 {
+                assert_eq!(r, Some(300));
+            }
+        }
+    }
+
+    #[test]
+    fn the_tail_of_a_transfer_never_seen_is_ignored() {
+        let frames = encode(&datagram(300), 0x100, 0).unwrap();
+        let mut rx = Reassembler::new(4);
+        let mut out = vec![0u8; MTU as usize];
+        for f in &frames[1..] {
+            assert_eq!(rx.decode(f.can_id, f.payload(), &mut out), None);
+        }
+    }
+
+    /// An urgent message from a node can arrive in the middle of its own bulk
+    /// one, and they are told apart by priority.
+    #[test]
+    fn transfers_interleave_when_their_identifiers_differ() {
+        let bulk_id = make_id(6, 0, 0xFF, 1);
+        let urgent_id = make_id(1, 0, 0xFF, 1);
+        let bulk = encode(&datagram(400), bulk_id, 0).unwrap();
+        let urgent = encode(&datagram(200), urgent_id, 0).unwrap();
+        let mut rx = Reassembler::new(4);
+        let mut out = vec![0u8; MTU as usize];
+        let mut done = Vec::new();
+        let mut a = bulk.iter();
+        let mut b = urgent.iter();
+        loop {
+            let (fa, fb) = (a.next(), b.next());
+            if fa.is_none() && fb.is_none() {
+                break;
+            }
+            for f in fa.into_iter().chain(fb) {
+                if let Some(n) = rx.decode(f.can_id, f.payload(), &mut out) {
+                    done.push((f.can_id, n));
+                }
+            }
+        }
+        assert!(done.contains(&(bulk_id | CAN_EFF_FLAG, 400)));
+        assert!(done.contains(&(urgent_id | CAN_EFF_FLAG, 200)));
+    }
+
+    /// The same node and priority, addressed differently, are one transfer to
+    /// the receiver: destination is not part of the key.
+    #[test]
+    fn the_destination_is_not_part_of_the_transfer_key() {
+        assert_eq!(
+            transfer_key(make_id(5, 0, 0x01, 7)),
+            transfer_key(make_id(5, 0, 0xFF, 7))
+        );
+        assert_ne!(
+            transfer_key(make_id(5, 0, 0x01, 7)),
+            transfer_key(make_id(5, 0, 0x01, 8))
+        );
+    }
+
+    #[test]
+    fn the_stalest_session_is_evicted_when_there_are_none_free() {
+        let mut rx = Reassembler::new(2);
+        let mut out = vec![0u8; MTU as usize];
+        let starts: Vec<_> = (1..=3u8)
+            .map(|src| encode(&datagram(300), make_id(5, 0, 0xFF, src), 0).unwrap())
+            .collect();
+        rx.decode(starts[0][0].can_id, starts[0][0].payload(), &mut out);
+        rx.decode(starts[1][0].can_id, starts[1][0].payload(), &mut out);
+        // Node 3 takes node 1's slot, the stalest.
+        rx.decode(starts[2][0].can_id, starts[2][0].payload(), &mut out);
+        assert!(rx.position(transfer_key(starts[0][0].can_id)).is_none());
+        assert!(rx.position(transfer_key(starts[1][0].can_id)).is_some());
+        assert!(rx.position(transfer_key(starts[2][0].can_id)).is_some());
+    }
+
+    #[test]
+    fn a_datagram_bigger_than_the_buffer_is_dropped_not_truncated() {
+        let frames = encode(&datagram(100), 0x100, 0).unwrap();
+        let mut rx = Reassembler::new(4);
+        let mut out = vec![0u8; 50];
+        for f in &frames {
+            assert_eq!(rx.decode(f.can_id, f.payload(), &mut out), None);
+        }
+    }
+
+    #[test]
+    fn the_identifier_layout() {
+        let id = make_id(5, 17, 0x42, 0x07);
+        assert_eq!(id, (5 << 26) | (17 << 21) | (0x42 << 8) | 0x07);
+        assert_eq!(id_src(id), 0x07);
+        assert_eq!(id_dst(id), 0x42);
+        assert!(id <= CAN_EFF_MASK);
+    }
+
+    /// A lower identifier wins arbitration, so an urgent message from any node
+    /// beats a bulk one from any other.
+    #[test]
+    fn priority_dominates_arbitration() {
+        assert!(make_id(1, 0, 0xFF, 200) < make_id(5, 0, 0xFF, 1));
+    }
+
+    #[test]
+    fn the_hardware_filter_selects_the_destination_and_extended_frames() {
+        let (id, mask) = filter_for(0x42);
+        assert_eq!(id, (0x42 << 8) | CAN_EFF_FLAG);
+        assert_eq!(mask, (0xFF << 8) | CAN_EFF_FLAG);
+        // Frame to 0x42, from anyone, at any priority
+        assert_eq!((make_id(3, 9, 0x42, 5) | CAN_EFF_FLAG) & mask, id);
+        // Frame to someone else
+        assert_ne!((make_id(3, 9, 0x43, 5) | CAN_EFF_FLAG) & mask, id);
+        // A standard frame with the same bits
+        assert_ne!(((0x42 << 8) & CAN_EFF_MASK) & mask, id);
+    }
+
+    fn frame_with(id: u32, len: u8) -> Frame {
+        let mut f = Frame::zeroed();
+        f.can_id = id;
+        f.len = len;
+        f
+    }
+
     #[test]
     fn classic_frames_are_not_ours() {
-        let (frame, _) = encode(0x101, &datagram(4)).unwrap();
-        let mut out = [0u8; FD_MAX_DLEN];
-        assert_eq!(
-            decode(&frame, 16, &f(0x100, 0, 0), &mut out),
-            Err(RxDrop::NotAFrame { nread: 16 })
-        );
+        let f = frame_with(make_id(5, 0, 1, 2) | CAN_EFF_FLAG, 8);
+        assert_eq!(accept(&f, 16, 1), Err(RxDrop::NotAFrame { nread: 16 }));
     }
 
     #[test]
-    fn extended_identifiers_are_refused() {
-        assert_eq!(
-            encode(0x800, &datagram(1)),
-            Err(TxError::IdentifierTooWide { id: 0x800 })
-        );
-        assert!(encode(CAN_SFF_MASK, &datagram(1)).is_ok());
-    }
-
-    #[test]
-    fn round_trip_every_length() {
-        for len in 0..=FD_MTU as usize {
-            let sent = datagram(len);
-            let (frame, wire) = encode(0x101, &sent).unwrap();
-            let mut out = [0u8; FD_MAX_DLEN];
-            let (n, sender) = decode(&frame, wire, &f(0x100, 0, 0), &mut out).unwrap();
-            assert_eq!(n, len);
-            assert_eq!(sender, 0x101);
-            assert_eq!(&out[..n], &sent[..]);
-        }
-    }
-
-    #[test]
-    fn padding_between_the_datagram_and_the_frame_end_is_zero() {
-        // A 12-byte datagram occupies 13 bytes and travels in a 16-byte frame.
-        let (frame, _) = encode(0x101, &datagram(12)).unwrap();
-        assert_eq!(frame.len, 16);
-        assert!(frame.data[13..].iter().all(|b| *b == 0));
-    }
-
-    #[test]
-    fn own_frames_are_dropped() {
-        let (frame, wire) = encode(0x100, &datagram(4)).unwrap();
-        let mut out = [0u8; FD_MAX_DLEN];
-        assert_eq!(
-            decode(&frame, wire, &f(0x100, 0, 0), &mut out),
-            Err(RxDrop::OwnFrame)
-        );
-    }
-
-    #[test]
-    fn a_zero_mask_accepts_every_identifier() {
-        let (frame, wire) = encode(0x7FF, &datagram(4)).unwrap();
-        let mut out = [0u8; FD_MAX_DLEN];
-        assert!(decode(&frame, wire, &f(0x100, 0, 0), &mut out).is_ok());
-    }
-
-    #[test]
-    fn a_nonzero_mask_rejects_outside_the_band() {
-        let mut out = [0u8; FD_MAX_DLEN];
-        // Band 0x100..=0x1FF.
-        let (inside, wire) = encode(0x1AB, &datagram(4)).unwrap();
-        assert!(decode(&inside, wire, &f(0x100, 0x100, 0x700), &mut out).is_ok());
-
-        let (outside, wire) = encode(0x2AB, &datagram(4)).unwrap();
-        assert_eq!(
-            decode(&outside, wire, &f(0x100, 0x100, 0x700), &mut out),
-            Err(RxDrop::Filtered { sender: 0x2AB })
-        );
-    }
-
-    #[test]
-    fn a_read_that_is_not_a_frame_is_dropped() {
-        let (frame, _) = encode(0x101, &datagram(4)).unwrap();
-        let mut out = [0u8; FD_MAX_DLEN];
-        for nread in [0usize, 1, 15, 16, 17, 71, 73] {
+    fn standard_remote_and_error_frames_are_not_ours() {
+        for id in [
+            0x123,
+            make_id(5, 0, 1, 2) | CAN_EFF_FLAG | CAN_RTR_FLAG,
+            CAN_ERR_FLAG | CAN_EFF_FLAG,
+        ] {
+            let f = frame_with(id, 8);
             assert_eq!(
-                decode(&frame, nread, &f(0x100, 0, 0), &mut out),
-                Err(RxDrop::NotAFrame { nread })
+                accept(&f, CANFD_MTU_WIRE, 1),
+                Err(RxDrop::NotExtended),
+                "{id:#x}"
             );
         }
     }
 
     #[test]
-    fn a_frame_with_no_length_byte_is_dropped() {
-        let mut frame = Frame::zeroed();
-        frame.can_id = 0x101;
-        frame.len = 0;
-        let mut out = [0u8; FD_MAX_DLEN];
+    fn our_own_frames_are_skipped() {
+        let f = frame_with(make_id(5, 0, 0xFF, 7) | CAN_EFF_FLAG, 8);
+        assert_eq!(accept(&f, CANFD_MTU_WIRE, 7), Err(RxDrop::OwnFrame));
+        assert_eq!(accept(&f, CANFD_MTU_WIRE, 8), Ok(make_id(5, 0, 0xFF, 7)));
+    }
+
+    #[test]
+    fn empty_and_oversized_payloads_are_dropped() {
+        let id = make_id(5, 0, 0xFF, 7) | CAN_EFF_FLAG;
         assert_eq!(
-            decode(&frame, CANFD_MTU_WIRE, &f(0x100, 0, 0), &mut out),
-            Err(RxDrop::NoLengthByte)
+            accept(&frame_with(id, 0), CANFD_MTU_WIRE, 1),
+            Err(RxDrop::BadLength)
         );
-    }
-
-    #[test]
-    fn a_length_byte_that_overruns_the_frame_is_dropped() {
-        let (mut frame, wire) = encode(0x101, &datagram(4)).unwrap();
-        frame.data[0] = 63; // frame.len is 5, so only 4 bytes are present
-        let mut out = [0u8; FD_MAX_DLEN];
         assert_eq!(
-            decode(&frame, wire, &f(0x100, 0, 0), &mut out),
-            Err(RxDrop::BadLength {
-                declared: 63,
-                available: 4
-            })
-        );
-    }
-
-    #[test]
-    fn a_datagram_larger_than_the_buffer_is_dropped_not_truncated() {
-        let (frame, wire) = encode(0x101, &datagram(20)).unwrap();
-        let mut out = [0u8; 8];
-        assert_eq!(
-            decode(&frame, wire, &f(0x100, 0, 0), &mut out),
-            Err(RxDrop::BufferTooSmall {
-                needed: 20,
-                have: 8
-            })
-        );
-    }
-
-    #[test]
-    fn wire_bytes_start_with_the_identifier_little_endian() {
-        let (frame, wire) = encode(0x123, &datagram(3)).unwrap();
-        let bytes = frame.as_wire_bytes(wire);
-        assert_eq!(bytes.len(), CANFD_MTU_WIRE);
-        assert_eq!(&bytes[..4], &[0x23, 0x01, 0x00, 0x00]);
-        assert_eq!(bytes[4], 4, "frame.len is the datagram plus its prefix");
-        assert_eq!(bytes[5], CANFD_BRS);
-        assert_eq!(&bytes[8..12], &[3, 1, 2, 3]);
-    }
-}
-
-/// Golden frames: the exact bytes the zenoh-pico sender puts on the wire.
-///
-/// These are hand-derived from `_z_send_can` in
-/// `src/system/unix/network.c` of the vendored zenoh-pico tree, not produced by
-/// [`encode`]. That is the point -- they are what makes the two implementations
-/// one wire format rather than two, and an interop regression fails here rather
-/// than on a bus.
-///
-/// Layout, for reading the tables below:
-/// `[0..4]` `can_id`, little-endian and native -- the C code assigns
-/// `frame.can_id = sock->_id` with no byte swap; `[4]` `frame.len`;
-/// `[5]` `frame.flags`; `[6]` `__res0`; `[7]` `__res1`; `[8]` the datagram
-/// length prefix; `[9..]` the datagram, then zeros.
-///
-/// Every byte past the datagram is zero because `_z_send_can` opens with
-/// `memset(&frame, 0, sizeof(frame))` and never writes the reserved fields or
-/// the DLC padding afterwards.
-#[cfg(test)]
-mod golden {
-    use super::*;
-
-    /// Pad a frame prefix out to its full wire length with zeros.
-    fn padded(prefix: &[u8], wire: usize) -> Vec<u8> {
-        let mut v = prefix.to_vec();
-        v.resize(wire, 0);
-        v
-    }
-
-    fn assert_golden(id: u32, datagram: &[u8], expected: &[u8]) {
-        let (frame, wire) = encode(id, datagram).unwrap();
-        assert_eq!(wire, expected.len(), "wire length");
-        assert_eq!(
-            frame.as_wire_bytes(wire),
-            expected,
-            "frame bytes for a {}-byte datagram on {:#x}",
-            datagram.len(),
-            id
-        );
-    }
-
-    /// `_z_send_can(sock{id=0x100, fd_mode=true}, ptr, 0)`.
-    ///
-    /// `payload = 1`, which is `<= 8`, so `frame_len` stays 1 and only the
-    /// `else if (sock->_fd_mode)` arm runs -- BRS is still set.
-    #[test]
-    fn empty_datagram_fd() {
-        assert_golden(
-            0x100,
-            &[],
-            &padded(
-                &[0x00, 0x01, 0x00, 0x00, 0x01, CANFD_BRS, 0x00, 0x00, 0x00],
-                CANFD_MTU_WIRE,
-            ),
-        );
-    }
-
-    /// `_z_send_can(sock{id=0x100, fd_mode=true}, "\x01..\x05", 5)`.
-    ///
-    /// `payload = 6`, still `<= 8`, so no DLC round-up.
-    #[test]
-    fn short_datagram_fd() {
-        assert_golden(
-            0x100,
-            &[1, 2, 3, 4, 5],
-            &padded(
-                &[
-                    0x00, 0x01, 0x00, 0x00, 0x06, CANFD_BRS, 0x00, 0x00, //
-                    0x05, 1, 2, 3, 4, 5,
-                ],
-                CANFD_MTU_WIRE,
-            ),
-        );
-    }
-
-    /// `_z_send_can(sock{id=0x101, fd_mode=true}, "\x01..\x0B", 11)`.
-    ///
-    /// `payload = 12`, and the round-up loop compares `payload <= steps[i]`, so
-    /// 12 selects the 12-byte step exactly rather than rounding on to 16.
-    #[test]
-    fn datagram_landing_exactly_on_a_dlc_step() {
-        assert_golden(
-            0x101,
-            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-            &padded(
-                &[
-                    0x01, 0x01, 0x00, 0x00, 0x0C, CANFD_BRS, 0x00, 0x00, //
-                    0x0B, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-                ],
-                CANFD_MTU_WIRE,
-            ),
-        );
-    }
-
-    /// `_z_send_can(sock{id=0x101, fd_mode=true}, "\x01..\x0C", 12)`.
-    ///
-    /// `payload = 13` rounds up to the 16-byte step, so `frame.len` is 16 while
-    /// only 13 bytes are meaningful. The three pad bytes are zero, and the
-    /// receiver recovers the true length from the prefix rather than the DLC --
-    /// which is the whole reason the prefix exists.
-    #[test]
-    fn datagram_that_must_round_up() {
-        assert_golden(
-            0x101,
-            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-            &padded(
-                &[
-                    0x01, 0x01, 0x00, 0x00, 0x10, CANFD_BRS, 0x00, 0x00, //
-                    0x0C, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
-                ],
-                CANFD_MTU_WIRE,
-            ),
-        );
-    }
-
-    /// `_z_send_can(sock{id=0x200, fd_mode=true}, "\x01..\x3F", 63)`.
-    ///
-    /// A full-MTU datagram: `payload = 64` fills the frame exactly, so there is
-    /// no padding at all.
-    #[test]
-    fn full_mtu_datagram_fd() {
-        let datagram: Vec<u8> = (1..=63).collect();
-        let mut expected = vec![0x00, 0x02, 0x00, 0x00, 0x40, CANFD_BRS, 0x00, 0x00, 0x3F];
-        expected.extend_from_slice(&datagram);
-        assert_eq!(expected.len(), CANFD_MTU_WIRE, "the frame is exactly full");
-        assert_golden(0x200, &datagram, &expected);
-    }
-
-    /// The receiver's rules, in the order `_z_read_can` applies them.
-    ///
-    /// A datagram shorter than the DLC is legal -- that is exactly what the
-    /// round-up case produces -- so the check is `declared > available`, not
-    /// `declared != available`.
-    #[test]
-    fn a_datagram_shorter_than_its_dlc_is_legal() {
-        let (frame, wire) = encode(0x101, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]).unwrap();
-        assert_eq!(frame.len, 16);
-        let mut out = [0u8; FD_MAX_DLEN];
-        let (n, sender) = decode(&frame, wire, &f(0x100, 0, 0), &mut out).unwrap();
-        assert_eq!((n, sender), (12, 0x101));
-        assert_eq!(&out[..n], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-    }
-
-    /// `mask == 0` short-circuits, so `match` is never consulted and every
-    /// identifier on the bus is admitted.
-    #[test]
-    fn a_zero_mask_ignores_match_entirely() {
-        let (frame, wire) = encode(0x7FF, &[1]).unwrap();
-        let mut out = [0u8; FD_MAX_DLEN];
-        assert!(decode(&frame, wire, &f(0x100, 0x555, 0), &mut out).is_ok());
-    }
-}
-
-/// The priority-major identifier layout.
-///
-/// A CAN identifier *is* the bus priority, so mapping zenoh's QoS onto the top
-/// bits of the identifier is what lets an urgent message win arbitration
-/// against a bulk burst -- including one from the same peer, which is the case
-/// zenoh-pico structurally cannot reach.
-#[cfg(test)]
-mod priority {
-    use super::*;
-
-    /// Zenoh's own numbering, lowest value highest priority.
-    const CONTROL: u8 = 0;
-    const REAL_TIME: u8 = 1;
-    const DATA: u8 = 5;
-    const BACKGROUND: u8 = 7;
-
-    /// The default. The wire must be exactly what zenoh-pico speaks, so the
-    /// identifier is the peer and the priority changes nothing at all.
-    #[test]
-    fn no_priority_bits_leaves_the_identifier_alone() {
-        for prio in 0..=7u8 {
-            assert_eq!(tx_id(0x101, 0, prio), 0x101);
-        }
-        assert_eq!(peer_mask(0), CAN_EFF_MASK);
-    }
-
-    /// Class in the top three bits, peer in the low eight.
-    #[test]
-    fn three_bits_put_the_class_above_the_peer() {
-        assert_eq!(tx_id(0x0A, 3, CONTROL), 0x00A);
-        assert_eq!(tx_id(0x0A, 3, REAL_TIME), 0x10A);
-        assert_eq!(tx_id(0x0A, 3, DATA), 0x50A);
-        assert_eq!(tx_id(0x0A, 3, BACKGROUND), 0x70A);
-    }
-
-    /// The property that makes this worth doing: a more urgent message from
-    /// **any** peer outranks a less urgent one from **any** peer, because the
-    /// class dominates from the most significant bit and a lower identifier
-    /// wins arbitration.
-    #[test]
-    fn class_dominates_peer_in_arbitration() {
-        // The lowest-numbered peer at Background still loses to the
-        // highest-numbered peer at Control.
-        assert!(tx_id(0xFF, 3, CONTROL) < tx_id(0x00, 3, BACKGROUND));
-        // And within a class, the lower peer wins, as before.
-        assert!(tx_id(0x01, 3, DATA) < tx_id(0x02, 3, DATA));
-    }
-
-    /// Zenoh numbers priorities with Control at 0 and Background at 7, and CAN
-    /// gives the bus to the lowest identifier, so the two orderings already
-    /// agree. Nothing is inverted anywhere, and this pins that.
-    #[test]
-    fn zenoh_priority_order_matches_arbitration_order() {
-        let ids: Vec<u32> = (0..=7u8).map(|p| tx_id(0x10, 3, p)).collect();
-        let mut sorted = ids.clone();
-        sorted.sort_unstable();
-        assert_eq!(ids, sorted, "more urgent must mean numerically lower");
-    }
-
-    /// One peer transmits under eight identifiers; all eight must resolve to
-    /// the same address, or the transport would see eight peers.
-    #[test]
-    fn every_class_resolves_to_one_peer() {
-        for prio in 0..=7u8 {
-            assert_eq!(tx_id(0x0A, 3, prio) & peer_mask(3), 0x0A);
-        }
-    }
-
-    /// The receiver must drop its own frames whatever class they carry. Getting
-    /// this wrong makes a peer talk to itself.
-    #[test]
-    fn own_frames_are_dropped_at_every_priority() {
-        let filter = RxFilter {
-            own: 0x0A,
-            match_: 0,
-            mask: 0,
-            prio_bits: 3,
-        };
-        let mut out = [0u8; FD_MAX_DLEN];
-        for prio in 0..=7u8 {
-            let (frame, wire) = encode(tx_id(0x0A, 3, prio), &[1, 2, 3]).unwrap();
-            assert_eq!(
-                decode(&frame, wire, &filter, &mut out),
-                Err(RxDrop::OwnFrame),
-                "priority {prio}"
-            );
-        }
-    }
-
-    /// And a different peer is delivered, at every class, under its peer id.
-    #[test]
-    fn other_peers_are_delivered_under_their_peer_id() {
-        let filter = RxFilter {
-            own: 0x0A,
-            match_: 0,
-            mask: 0,
-            prio_bits: 3,
-        };
-        let mut out = [0u8; FD_MAX_DLEN];
-        for prio in 0..=7u8 {
-            let (frame, wire) = encode(tx_id(0x0B, 3, prio), &[1, 2, 3]).unwrap();
-            let (n, sender) = decode(&frame, wire, &filter, &mut out).unwrap();
-            assert_eq!((n, sender), (3, 0x0B), "priority {prio}");
-        }
-    }
-
-    /// Fewer class bits fold neighbouring priorities together but must not
-    /// reorder them.
-    #[test]
-    fn fewer_bits_fold_without_reordering() {
-        // Two bits: four classes, pairs of priorities merged.
-        assert_eq!(tx_id(0x10, 2, CONTROL), tx_id(0x10, 2, REAL_TIME));
-        assert_eq!(tx_id(0x10, 2, DATA), tx_id(0x10, 2, 4));
-        let ids: Vec<u32> = (0..=7u8).map(|p| tx_id(0x10, 2, p)).collect();
-        let mut sorted = ids.clone();
-        sorted.sort_unstable();
-        assert_eq!(ids, sorted);
-        // One bit: urgent half versus bulk half.
-        assert_eq!(tx_id(0x10, 1, CONTROL), 0x010);
-        assert_eq!(tx_id(0x10, 1, DATA), 0x410);
-    }
-
-    /// Class bits come out of the peer space, and the budget must be stated.
-    #[test]
-    fn class_bits_cost_peer_space() {
-        assert_eq!(max_peer_id(0), 0x7FF); // 2048 peers, no classes
-        assert_eq!(max_peer_id(1), 0x3FF);
-        assert_eq!(max_peer_id(2), 0x1FF);
-        assert_eq!(max_peer_id(3), 0x0FF); // 256 peers, 8 classes
-    }
-
-    /// A band still selects peers, not classes, so a filtered bus keeps working
-    /// when priority bits are switched on.
-    #[test]
-    fn bands_filter_on_the_peer_field() {
-        let filter = RxFilter {
-            own: 0x0A,
-            match_: 0x00,
-            mask: 0xF0,
-            prio_bits: 3,
-        };
-        let mut out = [0u8; FD_MAX_DLEN];
-        // Peer 0x0B is inside the band 0x00/0xF0, at the noisiest class.
-        let (inside, wire) = encode(tx_id(0x0B, 3, BACKGROUND), &[1]).unwrap();
-        assert!(decode(&inside, wire, &filter, &mut out).is_ok());
-        // Peer 0x1B is outside it, even at the most urgent class.
-        let (outside, wire) = encode(tx_id(0x1B, 3, CONTROL), &[1]).unwrap();
-        assert_eq!(
-            decode(&outside, wire, &filter, &mut out),
-            Err(RxDrop::Filtered { sender: 0x1B })
+            accept(&frame_with(id, 65), CANFD_MTU_WIRE, 1),
+            Err(RxDrop::BadLength)
         );
     }
 }

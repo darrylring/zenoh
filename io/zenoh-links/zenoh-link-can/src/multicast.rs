@@ -17,8 +17,8 @@ use zenoh_link_commons::{LinkManagerMulticastTrait, LinkMulticast};
 use zenoh_protocol::core::EndPoint;
 use zenoh_result::ZResult;
 
-/// A CAN bus is a broadcast medium, so peers do not pair off: they all listen
-/// and filter by identifier. There is no connect side and no accept.
+/// The multicast side of the link: every frame goes to all nodes and every
+/// node's frames are heard. There is no connect side and no accept.
 #[derive(Debug, Default)]
 pub struct LinkManagerMulticastCan;
 
@@ -49,9 +49,10 @@ async fn new_link_inner(ep: crate::CanEndpoint) -> ZResult<LinkMulticast> {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use std::{borrow::Cow, fmt};
+    use std::{borrow::Cow, fmt, sync::Mutex};
 
     use async_trait::async_trait;
+    use zenoh_core::zlock;
     use zenoh_link_commons::{LinkAuthId, LinkMulticastTrait};
     use zenoh_protocol::{
         core::{Locator, Priority},
@@ -59,38 +60,41 @@ mod imp {
     };
     use zenoh_result::ZResult;
 
-    use crate::{sys::CanSocket, CanEndpoint};
+    use crate::{
+        frame::{self, Reassembler},
+        sys::CanSocket,
+        CanEndpoint,
+    };
 
     pub(super) struct LinkMulticastCan {
         socket: CanSocket,
-        /// This peer's own address on the bus.
+        /// This node's own address on the bus.
         src_locator: Locator,
-        /// The identifier band this link listens to, which is what the
-        /// transport manager keys the multicast transport by.
-        group_locator: Locator,
+        /// Everybody, which is where a multicast link sends.
+        dst_locator: Locator,
         endpoint: CanEndpoint,
+        rx: Mutex<Reassembler>,
     }
 
     impl LinkMulticastCan {
         pub(super) fn new(endpoint: CanEndpoint) -> ZResult<LinkMulticastCan> {
-            let socket = CanSocket::open(&endpoint)?;
-            let src_locator = endpoint.peer_locator(endpoint.id);
-            let group_locator = endpoint.group_locator();
+            let socket = CanSocket::open(&endpoint, frame::NODE_BROADCAST)?;
+            let src_locator = endpoint.node_locator(endpoint.id);
+            let dst_locator = endpoint.broadcast_locator();
 
             tracing::debug!(
-                "CAN link on {:?}: id {:#x}, band {:#x}/{:#x}, MTU {}",
+                "CAN multicast link on {:?}: node {}, MTU {}",
                 endpoint.device,
                 endpoint.id,
-                endpoint.filter_match,
-                endpoint.filter_mask,
-                socket.mtu()
+                frame::MTU
             );
 
             Ok(LinkMulticastCan {
                 socket,
                 src_locator,
-                group_locator,
+                dst_locator,
                 endpoint,
+                rx: Mutex::new(Reassembler::new(frame::RX_SESSIONS_MULTICAST)),
             })
         }
     }
@@ -98,7 +102,7 @@ mod imp {
     #[async_trait]
     impl LinkMulticastTrait for LinkMulticastCan {
         fn get_mtu(&self) -> BatchSize {
-            self.socket.mtu()
+            frame::MTU
         }
 
         fn get_src(&self) -> &Locator {
@@ -106,7 +110,7 @@ mod imp {
         }
 
         fn get_dst(&self) -> &Locator {
-            &self.group_locator
+            &self.dst_locator
         }
 
         fn get_auth_id(&self) -> &LinkAuthId {
@@ -121,31 +125,37 @@ mod imp {
         }
 
         async fn write(&self, buffer: &[u8]) -> ZResult<usize> {
-            self.socket.send(buffer, Priority::DEFAULT as u8).await
+            self.socket
+                .send(buffer, frame::NODE_BROADCAST, frame::PRIO_DEFAULT)
+                .await
         }
 
-        /// A datagram link writes one frame or fails; there is no partial write
-        /// to loop over. zenoh's transport never hands the link more than its
-        /// MTU, because the transmission pipeline clamps to it and fragments
-        /// above it.
+        /// A datagram link writes one datagram or fails; there is no partial
+        /// write to loop over. zenoh's transport never hands the link more than
+        /// its MTU, because the transmission pipeline clamps to it and
+        /// fragments above it.
         async fn write_all(&self, buffer: &[u8]) -> ZResult<()> {
+            self.write(buffer).await.map(|_| ())
+        }
+
+        /// A CAN identifier **is** the bus priority, so this is the one place
+        /// the batch's priority belongs on the wire.
+        async fn write_all_with_priority(&self, buffer: &[u8], priority: Priority) -> ZResult<()> {
             self.socket
-                .send(buffer, Priority::DEFAULT as u8)
+                .send(buffer, frame::NODE_BROADCAST, priority as u8)
                 .await
                 .map(|_| ())
         }
 
-        /// A CAN identifier **is** the bus priority, so this is the one link
-        /// where the batch's priority belongs on the wire. With `prio_bits=0`,
-        /// the default, it changes nothing and the frames stay exactly what
-        /// zenoh-pico speaks.
-        async fn write_all_with_priority(&self, buffer: &[u8], priority: Priority) -> ZResult<()> {
-            self.socket.send(buffer, priority as u8).await.map(|_| ())
-        }
-
         async fn read<'a>(&'a self, buffer: &mut [u8]) -> ZResult<(usize, Cow<'a, Locator>)> {
-            let (n, sender) = self.socket.recv(buffer).await?;
-            Ok((n, Cow::Owned(self.endpoint.peer_locator(sender))))
+            loop {
+                let (id, f) = self.socket.recv().await?;
+                let n = zlock!(self.rx).decode(id, f.payload(), buffer);
+                if let Some(n) = n {
+                    let sender = frame::id_src(id);
+                    return Ok((n, Cow::Owned(self.endpoint.node_locator(sender))));
+                }
+            }
         }
 
         async fn close(&self) -> ZResult<()> {
@@ -158,7 +168,7 @@ mod imp {
 
     impl fmt::Display for LinkMulticastCan {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "{} => {}", self.src_locator, self.group_locator)
+            write!(f, "{} => {}", self.src_locator, self.dst_locator)
         }
     }
 
@@ -166,10 +176,8 @@ mod imp {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("Can")
                 .field("device", &self.endpoint.device)
-                .field("id", &self.endpoint.id)
-                .field("match", &self.endpoint.filter_match)
-                .field("mask", &self.endpoint.filter_mask)
-                .field("mtu", &self.socket.mtu())
+                .field("node", &self.socket.node())
+                .field("mtu", &frame::MTU)
                 .finish()
         }
     }

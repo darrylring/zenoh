@@ -71,25 +71,39 @@ mod tests {
     const SLEEP: Duration = Duration::from_secs(1);
     const SLEEP_COUNT: Duration = Duration::from_millis(10);
 
-    /// Far fewer than the UDP test's 1 000: every message here is fragmented
-    /// across a 63-byte MTU, so this is already thousands of frames.
+    /// Far fewer than the UDP test's 1 000: every message here is several CAN
+    /// frames, so this is already thousands of them.
     const MSG_COUNT: usize = 100;
 
-    /// Well above the link MTU, so zenoh's own fragmentation drives the link.
-    /// 189 bytes is the figure measured with two zenoh-pico peers, so
-    /// the two phases are directly comparable.
+    /// Over a frame, so the link's own segmentation carries it, and under the
+    /// link MTU, so zenoh's does not.
     const MSG_SIZE_FRAGMENTED: [usize; 1] = [189];
 
-    /// Past a single batch, so fragmentation is exercised well beyond one frame
-    /// worth of bookkeeping.
-    const MSG_SIZE_LARGE: [usize; 1] = [4_096];
+    /// Past the link MTU, so zenoh's own fragmentation drives the link as well
+    /// as the link's segmentation driving the bus.
+    const MSG_SIZE_LARGE: [usize; 1] = [8_192];
+
+    /// The two kinds of endpoint, for node `id`. Multicast is the locator's
+    /// `mode`, because zenoh decides the kind of link from the locator alone.
+    fn multicast_endpoint(id: u8, config: &str) -> EndPoint {
+        format!("can/{DEVICE}?mode=multicast#id={id}{config}")
+            .parse()
+            .unwrap()
+    }
 
     const DEVICE: &str = "vcan0";
 
     /// Whether the virtual bus exists. Creating one needs root, so a developer
     /// without it gets an explanation rather than a failure.
     fn vcan_present() -> bool {
-        if std::path::Path::new(&format!("/sys/class/net/{DEVICE}")).exists() {
+        // /proc/net/dev lists the interfaces of this process's network
+        // namespace, which /sys/class/net does not when the test runs in one of
+        // its own (`unshare -rn`).
+        let present = std::fs::read_to_string("/proc/net/dev").is_ok_and(|devs| {
+            devs.lines()
+                .any(|l| l.trim_start().starts_with(&format!("{DEVICE}:")))
+        });
+        if present {
             return true;
         }
         println!("SKIPPING: no `{DEVICE}` interface. Create one with `ci/vcan-setup.sh`.");
@@ -130,7 +144,11 @@ mod tests {
             _peer: TransportPeer,
             _transport: TransportUnicast,
         ) -> ZResult<Arc<dyn TransportPeerEventHandler>> {
-            panic!("a CAN link is multicast only");
+            Ok(Arc::new(SCPeer::new(
+                self.count.clone(),
+                self.corrupt.clone(),
+                self.expected.clone(),
+            )))
         }
 
         fn new_multicast(
@@ -432,8 +450,8 @@ mod tests {
             return;
         }
 
-        let e01: EndPoint = format!("can/{DEVICE}#id=0x100").parse().unwrap();
-        let e02: EndPoint = format!("can/{DEVICE}#id=0x101").parse().unwrap();
+        let e01: EndPoint = multicast_endpoint(1, "");
+        let e02: EndPoint = multicast_endpoint(2, "");
         run((&e01, &e02), &channels(), &MSG_SIZE_FRAGMENTED).await;
     }
 
@@ -452,137 +470,9 @@ mod tests {
         // receive buffer the kernel drops the overflow before the link sees it,
         // and 31% of messages are lost with no error anywhere. This is the
         // knob for that, and this test is its demonstration.
-        let e01: EndPoint = format!("can/{DEVICE}#id=0x110;so_rcvbuf=8388608")
-            .parse()
-            .unwrap();
-        let e02: EndPoint = format!("can/{DEVICE}#id=0x111;so_rcvbuf=8388608")
-            .parse()
-            .unwrap();
+        let e01 = multicast_endpoint(1, ";so_rcvbuf=8388608");
+        let e02 = multicast_endpoint(2, ";so_rcvbuf=8388608");
         run((&e01, &e02), &channels()[..1], &MSG_SIZE_LARGE).await;
-    }
-
-    /// With `prio_bits` set, one peer transmits under several
-    /// identifiers -- one per traffic class -- and every one of them must still
-    /// resolve to that single peer. If it did not, the transport would see
-    /// eight peers where there is one, and a peer would hear its own frames.
-    ///
-    /// What this test cannot show is the point of the feature. `vcan` has no
-    /// arbitration: frames are queued, not contended for, so an urgent message
-    /// overtaking a bulk burst is not observable here at all. That needs a real
-    /// bus. What is checked here is that the addressing
-    /// survives, which is the part that can be got wrong in software.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a vcan0 interface; see the module docs"]
-    async fn transport_multicast_can_priority_major_ids() {
-        zenoh_util::init_log_from_env_or("error");
-        if !vcan_present() {
-            return;
-        }
-
-        // Three class bits leave eight for the peer, so the identifiers are
-        // 0x?0A and 0x?0B with the class in the top nibble.
-        let e01: EndPoint = format!("can/{DEVICE}#id=0x0A;prio_bits=3;so_rcvbuf=8388608")
-            .parse()
-            .unwrap();
-        let e02: EndPoint = format!("can/{DEVICE}#id=0x0B;prio_bits=3;so_rcvbuf=8388608")
-            .parse()
-            .unwrap();
-
-        // Both a high and a low priority, so more than one class is actually
-        // put on the wire and both have to arrive.
-        let channel = [
-            Channel {
-                priority: Priority::RealTime,
-                reliability: Reliability::BestEffort,
-            },
-            Channel {
-                priority: Priority::Background,
-                reliability: Reliability::BestEffort,
-            },
-        ];
-        // NOTE: QoS stays OFF here, so the identifiers do not in fact leave
-        // class 0 -- see `join_with_qos_does_not_fit_one_can_frame` below for
-        // why turning it on cannot work on CAN FD. What this test does prove is
-        // that the priority-major layout has not broken addressing: peers still
-        // find each other and every message arrives intact when the identifier
-        // is split into a class field and a peer field.
-        run_qos((&e01, &e02), &channel, &MSG_SIZE_FRAGMENTED, false).await;
-    }
-
-    /// The blocker: **a `Join` carrying per-priority sequence
-    /// numbers does not fit one CAN FD frame**, so the traffic-class field can
-    /// never be exercised on this medium as the protocol stands.
-    ///
-    /// Mapping zenoh priority onto the identifier only does anything when the
-    /// multicast transport keeps one queue per priority, because otherwise
-    /// every batch reports priority index 0. Turning that on makes `Join` carry
-    /// eight `PrioritySn` instead of one -- and `Join` is written as a single
-    /// datagram with no fragmentation, so on a 63-byte link the transmit task
-    /// dies before the session starts.
-    ///
-    /// This test needs no bus. It measures both encodings so the margin is a
-    /// number, and it will fail loudly if the `Join` ever shrinks enough to fit
-    /// -- which is the day this feature becomes usable.
-    #[test]
-    fn join_with_qos_does_not_fit_one_can_frame() {
-        use zenoh_buffers::writer::HasWriter;
-        use zenoh_codec::{WCodec, Zenoh080};
-        use zenoh_protocol::{
-            core::{Resolution, WhatAmI, ZenohIdProto},
-            transport::{join::ext::PatchType, Join, PrioritySn, TransportMessage},
-        };
-
-        const CAN_FD_MTU: usize = 63;
-
-        fn encoded_len(ext_qos: Option<Box<[PrioritySn; Priority::NUM]>>) -> usize {
-            // Sequence numbers near the top of the resolution, which is what a
-            // randomly seeded session actually starts with, so the varints are
-            // their realistic width rather than one byte.
-            let sn = PrioritySn {
-                reliable: 0x0FFF_FFFF,
-                best_effort: 0x0FFF_FFFF,
-            };
-            let msg: TransportMessage = Join {
-                version: 0x09,
-                whatami: WhatAmI::Peer,
-                zid: ZenohIdProto::rand(),
-                resolution: Resolution::default(),
-                batch_size: CAN_FD_MTU as u16,
-                lease: Duration::from_secs(60),
-                next_sn: sn,
-                ext_qos,
-                ext_shm: None,
-                ext_patch: PatchType::CURRENT,
-            }
-            .into();
-
-            let mut buf = Vec::new();
-            let codec = Zenoh080::new();
-            codec.write(&mut buf.writer(), &msg).unwrap();
-            buf.len()
-        }
-
-        let without = encoded_len(None);
-        let with = encoded_len(Some(Box::new(
-            [PrioritySn {
-                reliable: 0x0FFF_FFFF,
-                best_effort: 0x0FFF_FFFF,
-            }; Priority::NUM],
-        )));
-
-        println!(
-            "Join without QoS: {without} bytes; with QoS: {with} bytes; CAN FD MTU {CAN_FD_MTU}"
-        );
-
-        assert!(
-            without <= CAN_FD_MTU,
-            "a plain Join must fit, or the link could never work at all: {without} > {CAN_FD_MTU}"
-        );
-        assert!(
-            with > CAN_FD_MTU,
-            "Join with per-priority SNs now fits ({with} <= {CAN_FD_MTU}); \
-             W7 may be unblocked -- re-test with multicast QoS enabled"
-        );
     }
 
     /// Four peers on one bus, which is the first test that is not a pair.
@@ -611,9 +501,7 @@ mod tests {
                 .whatami(WhatAmI::Peer)
                 .build_test(handler.clone())
                 .unwrap();
-            let ep: EndPoint = format!("can/{DEVICE}#id=0x{:x};so_rcvbuf=8388608", 0x140 + i)
-                .parse()
-                .unwrap();
+            let ep = multicast_endpoint(10 + i as u8, ";so_rcvbuf=8388608");
             ztimeout!(manager.open_transport_multicast(ep)).unwrap();
             managers.push(manager);
             handlers.push(handler);
@@ -697,11 +585,11 @@ mod tests {
         tokio::time::sleep(SLEEP).await;
     }
 
-    /// The link reports the MTU of the mode it actually obtained,
-    /// and a band that excludes a peer's own identifier is refused at open.
+    /// The link reports the MTU of the whole datagram, not of a frame, and
+    /// refuses what could never work.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs a vcan0 interface; see the module docs"]
-    async fn can_link_open_reports_its_mode() {
+    async fn can_link_open_reports_its_mtu() {
         zenoh_util::init_log_from_env_or("error");
         if !vcan_present() {
             return;
@@ -714,28 +602,33 @@ mod tests {
             .build_test(handler)
             .unwrap();
 
-        let ep: EndPoint = format!("can/{DEVICE}#id=0x120").parse().unwrap();
+        let ep = multicast_endpoint(3, "");
         let transport = ztimeout!(manager.open_transport_multicast(ep)).unwrap();
         let mtu = transport.get_link().unwrap().mtu;
-        // 63 with CAN FD, 7 if the interface refused it. A virtual bus supports
-        // FD, so anything else means the negotiation regressed.
-        assert_eq!(mtu, 63, "vcan0 should negotiate CAN FD");
+        // The link segments and reassembles itself, so zenoh sees a datagram
+        // link with a 4095-byte MTU rather than a 63-byte one.
+        assert_eq!(mtu, 4095, "the link carries whole datagrams");
         ztimeout!(transport.close()).unwrap();
 
-        // An identifier outside its own band could never be addressed, so the
-        // link refuses it rather than degrading quietly.
-        let bad: EndPoint = format!("can/{DEVICE}#id=0x201;match=0x100;mask=0x700")
-            .parse()
-            .unwrap();
-        let err = ztimeout!(manager.open_transport_multicast(bad)).unwrap_err();
+        // Classic CAN is not supported, and says so.
+        let classic = multicast_endpoint(3, ";dbitrate=0");
+        let err = ztimeout!(manager.open_transport_multicast(classic)).unwrap_err();
         assert!(
-            err.to_string().contains("outside its own"),
+            err.to_string().contains("CAN FD"),
+            "unexpected error: {err}"
+        );
+
+        // 0xFF is everybody, so it cannot be a node.
+        let broadcast = multicast_endpoint(255, "");
+        let err = ztimeout!(manager.open_transport_multicast(broadcast)).unwrap_err();
+        assert!(
+            err.to_string().contains("0..=254"),
             "unexpected error: {err}"
         );
 
         // An over-long interface name is refused before open, with the limit
         // named, rather than truncating into some other interface.
-        let long: EndPoint = "can/vcan-nonexistent".parse().unwrap();
+        let long: EndPoint = "can/vcan-nonexistent?mode=multicast".parse().unwrap();
         let err = ztimeout!(manager.open_transport_multicast(long)).unwrap_err();
         assert!(
             err.to_string().contains("at most 15"),
@@ -745,11 +638,109 @@ mod tests {
         // No interface of that name, and the error should say so. The name is
         // kept under IFNAMSIZ so this exercises the missing-interface path
         // rather than the name-length guard.
-        let missing: EndPoint = "can/vcan9nope".parse().unwrap();
+        let missing: EndPoint = "can/vcan9nope?mode=multicast".parse().unwrap();
         let err = ztimeout!(manager.open_transport_multicast(missing)).unwrap_err();
         assert!(
             err.to_string().contains("no such interface"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A router listens on a unicast locator and two clients connect to it: the
+    /// shape of zenoh-pico clients on a bus, with a Rust router. Each client
+    /// gets a link of its own, and its messages arrive intact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a vcan0 interface; see the module docs"]
+    async fn transport_unicast_can_two_clients() {
+        zenoh_util::init_log_from_env_or("error");
+        if !vcan_present() {
+            return;
+        }
+
+        let payload = pattern(MSG_SIZE_LARGE[0]);
+
+        let router_handler = Arc::new(SHPeer::new(payload.clone()));
+        let router = TransportManager::builder()
+            .zid(ZenohIdProto::try_from([10]).unwrap())
+            .whatami(WhatAmI::Router)
+            .build_test(router_handler.clone())
+            .unwrap();
+        let listen: EndPoint = format!("can/{DEVICE}#id=1;so_rcvbuf=8388608")
+            .parse()
+            .unwrap();
+        let locator = ztimeout!(router.add_listener(listen)).unwrap();
+        println!("Router listening on {locator}");
+
+        let mut clients = Vec::new();
+        for node in [2u8, 3] {
+            let handler = Arc::new(SHPeer::new(payload.clone()));
+            let manager = TransportManager::builder()
+                .zid(ZenohIdProto::try_from([node]).unwrap())
+                .whatami(WhatAmI::Client)
+                .build_test(handler)
+                .unwrap();
+            let ep: EndPoint = format!("can/{DEVICE}#id={node};peer=1;so_rcvbuf=8388608")
+                .parse()
+                .unwrap();
+            let transport = ztimeout!(manager.open_transport_unicast(ep)).unwrap();
+            println!(
+                "\tClient {node} link MTU: {}",
+                transport.get_links().unwrap()[0].mtu
+            );
+            clients.push((manager, transport));
+        }
+        assert_eq!(ztimeout!(router.get_transports_unicast()).len(), 2);
+
+        let message = NetworkMessage::from(Push {
+            wire_expr: "test".into(),
+            ext_qos: QoSType::new(Priority::DEFAULT, CongestionControl::Block, false),
+            ..Push::from(payload.clone())
+        });
+        for (_, transport) in &clients {
+            for _ in 0..20 {
+                transport.schedule(message.clone().as_mut()).unwrap();
+            }
+        }
+
+        ztimeout!(async {
+            while router_handler.get_count() < 40 {
+                tokio::time::sleep(SLEEP_COUNT).await;
+            }
+        });
+        assert_eq!(router_handler.get_count(), 40);
+        assert_eq!(router_handler.get_corrupt(), 0);
+
+        // And the other way: the router answers each client over its own link.
+        for transport in ztimeout!(router.get_transports_unicast()) {
+            for _ in 0..5 {
+                transport.schedule(message.clone().as_mut()).unwrap();
+            }
+        }
+        for (_, transport) in &clients {
+            transport.close().await.unwrap();
+        }
+        ztimeout!(async {
+            while !ztimeout!(router.get_transports_unicast()).is_empty() {
+                tokio::time::sleep(SLEEP_COUNT).await;
+            }
+        });
+    }
+
+    /// Connecting without saying who to talk to is a mistake worth naming.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a vcan0 interface; see the module docs"]
+    async fn can_unicast_connect_needs_a_peer() {
+        zenoh_util::init_log_from_env_or("error");
+        if !vcan_present() {
+            return;
+        }
+        let manager = TransportManager::builder()
+            .zid(ZenohIdProto::try_from([4]).unwrap())
+            .whatami(WhatAmI::Client)
+            .build_test(Arc::new(SHPeer::new(Vec::new())))
+            .unwrap();
+        let ep: EndPoint = format!("can/{DEVICE}#id=4").parse().unwrap();
+        let err = ztimeout!(manager.open_transport_unicast(ep)).unwrap_err();
+        assert!(err.to_string().contains("peer="), "unexpected error: {err}");
     }
 }

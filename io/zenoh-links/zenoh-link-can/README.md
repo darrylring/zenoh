@@ -11,18 +11,42 @@ It is highly recommended to depend solely on the zenoh and zenoh-ext crates and 
 
 A CAN FD transport, behind the `transport_can` feature. Linux only: it is built on SocketCAN.
 
-**CAN FD is required, not preferred.** A classic CAN frame carries 8 bytes. A zenoh `Join` is 33 bytes at its smallest, and transport messages are never fragmented -- they must fit one batch whole or the session never opens. So a classic link is not a slower link, it is one that cannot establish at all. An interface that does not negotiate FD is refused at open, and `dbitrate=0` is refused at parse.
+It speaks the same wire format as zenoh-pico's CAN link (`link/transport/can.h` and `can_codec.c`), so the two talk to each other over one bus with no special configuration.
 
-For classic CAN hardware, use the `isotp` link instead: ISO 15765-2 segments below zenoh, giving a 4095-byte MTU on 8-byte frames.
+**CAN FD is required.** zenoh-pico also has a classic CAN mode with 8-byte frames; this link neither sends nor hears them. It refuses an interface that is not FD at open, and `dbitrate=0` at parse. An adapter that is classic-only -- a PCAN-USB, as opposed to a PCAN-USB FD -- cannot be used.
 
-A CAN bus is a broadcast medium -- every node hears every frame and filters by identifier -- so this is a **multicast** link. Each peer owns one identifier, transmits on it, accepts frames from every other identifier the mask admits, and drops its own. The sender's identifier is that peer's address.
+### Link kinds
 
-CAN frames are bounded and self-delimiting, so this is a **datagram** link: zenoh's transport fragments anything larger than the MTU, and the link itself needs no segmentation or reassembly.
+The link is a **datagram** link with a 4095-byte MTU. It segments a datagram into CAN FD frames and reassembles it on receipt itself (see below), so zenoh's own fragmentation never runs on it.
+
+There are two kinds of link, and they use the same frames:
+
+| | unicast (default) | multicast |
+| --- | --- | --- |
+| Locator | `can/can0#id=1;peer=2` | `can/can0?mode=multicast#id=1` |
+| Sends to | `peer` | every node |
+| Hears | only `peer` | everybody |
+| Connect | opens a link to `peer` | |
+| Listen | accepts every node that sends to it, a link each, as a UDP listener does | one link that hears everybody |
+| zenoh-pico | what it opens when it **connects** to a locator | what it opens when it **listens** on one |
+
+zenoh-pico picks the kind by whether it connects or listens. zenoh does not: it decides what kind of link a locator is from the locator alone, before `#`, so the kind is the locator's `mode`. To accept a pico client, a router listens on a unicast locator and the client connects to it:
+
+```sh
+# the router, node 1
+zenohd -l can/can0#id=1
+
+# a zenoh-pico client, node 2, which talks to node 1
+z_pub -m client -e 'can/can0#id=2;peer=1' ...
+```
+
+A pico peer that **listens** on `can/can0#id=2` is a multicast link, and talks to a Rust peer on `can/can0?mode=multicast#id=1`. Multicast peers must agree on the batch size, which zenoh-pico takes from `Z_BATCH_MULTICAST_SIZE` (2048 by default) and advertises as is, and which this link advertises as the smaller of zenoh's configured batch size and 4095. Make them equal: build pico with a `BATCH_MULTICAST_SIZE` that matches, or set `transport/link/tx/batch_size` here.
 
 ### Endpoints
 
 ```text
-can/<device>#bitrate=500000;dbitrate=2000000;id=0x100;match=0;mask=0
+can/<device>#bitrate=500000;dbitrate=2000000;id=1;peer=2
+can/<device>?mode=multicast#id=1
 ```
 
 | key | meaning |
@@ -30,76 +54,45 @@ can/<device>#bitrate=500000;dbitrate=2000000;id=0x100;match=0;mask=0
 | `device` | the CAN interface name, such as `can0` or `vcan0` |
 | `bitrate` | arbitration-phase bit rate |
 | `dbitrate` | CAN FD data-phase bit rate. Must be non-zero |
-| `id` | **this** peer's identifier, and its address on the bus |
-| `match` | accept frames whose `(id & mask) == match` |
-| `mask` | `0`, the default, accepts every identifier on the bus |
+| `id` | **this** node, 0..=254, the source in every identifier it sends. Unique on the bus |
+| `peer` | 0..=254, the one node a unicast link talks to. Required to connect |
 | `so_rcvbuf` | receive buffer in bytes. Absent, the kernel default applies |
+| `mode` | on the locator, before `#`: `unicast` (default) or `multicast` |
 
-On Linux the bit rates are advisory: rates are set out of band with `ip link set can0 type can bitrate ...`, and a virtual interface has none at all. They are still validated, because `dbitrate=0` used to select classic CAN and now means a misconfiguration.
+On Linux the bit rates are advisory: rates are set out of band, and a virtual interface has none at all. They are still validated. For a real adapter:
 
-The MTU is 63 bytes: one CAN FD frame, less a one-byte length prefix.
+```sh
+sudo ip link set can0 down
+sudo ip link set can0 type can bitrate 125000 dbitrate 125000 fd on
+sudo ip link set can0 txqueuelen 1000
+sudo ip link set can0 up
+```
+
+`txqueuelen` matters because a 4 KiB datagram is about 66 frames and goes out in a burst. When the controller's queue is full the link waits for room, for a quarter of a second, rather than send part of a datagram. A datagram that still does not fit is dropped, and zenoh's own reliability covers it.
+
+### Wire format
+
+The identifier is 29 bits, and carries the bus priority as well as the address:
+
+```text
+  28..26  priority   zenoh priority (0 = control ... 7 = background)
+  25..21  key id     the sender's ExprId for the topic, 0 = none (not filled in yet)
+  20..16  reserved   zero
+  15..8   destination node, 0xFF = every node
+   7..0   source node
+```
+
+A **lower identifier wins arbitration**, and the priority is in the high bits, so an urgent message beats a bulk one on the wire regardless of which node sent it. The controller's hardware filter selects on the destination, so a node's CPU never sees frames for others.
+
+The last byte of every frame is a tail byte -- start, end, a toggle that alternates, and a 5-bit transfer id -- and the transfer is `length prefix | datagram | zero padding | CRC-16/CCITT-FALSE`. The CRC is there only when a datagram needs more than one frame. [`frame.rs`](src/frame.rs) documents it and unit-tests it, with no bus.
+
+Frames of different transfers interleave on a bus, so a receiver keeps a transfer per (priority, key, source). A frame that is lost, or out of order, drops its transfer and the sender's next one starts clean.
 
 ### `so_rcvbuf`, and when it matters
 
-Frames arriving faster than the link drains them are dropped by the kernel,
-silently, before the link sees them. A real bus cannot outrun the reader:
-2 Mbit/s of CAN FD is under 2 800 frames per second. A **virtual** interface can,
-because it has no bit rate at all.
+Frames arriving faster than the link drains them are dropped by the kernel, silently, before the link sees them. A real bus cannot outrun the reader: 2 Mbit/s of CAN FD is under 2 800 frames per second. A **virtual** interface can, because it has no bit rate at all, so a test over `vcan0` that sends bursts wants `so_rcvbuf=8388608`.
 
-Measured on `vcan0`: 100 messages of 4 KiB -- 71 frames each, 7 100 frames in a
-burst -- lost 31% of messages on the default buffer, and none at all on 8 MiB.
-Nothing reported an error in either case, which is what makes it worth naming.
-
-The kernel clamps the request to `net.core.rmem_max` without saying so, so the
-link reads the value back and warns when it fell short.
-
-### Identifier value is bus priority
-
-A **lower identifier wins arbitration**, so `id` is a real-time decision and not a name. The peer that must not be delayed needs the lower identifier.
-
-The defaults are a starting point, not an allocation. Two peers that both accept them differ only by whichever was configured first, which is a priority ordering nobody chose. Priority is also per **peer**, not per message: one identifier carries all of a peer's traffic.
-
-Only 11-bit identifiers are supported. `id`, `match` and `mask` above `0x7FF` are refused at open.
-
-### Interoperating with zenoh-pico
-
-zenoh-pico has a CAN link of the same wire format, and the two talk to each other
-over one bus. One thing has to be arranged first.
-
-zenoh-pico's `Z_BATCH_MULTICAST_SIZE` is a **compile-time constant, default
-2048**, and it is advertised verbatim in the `Join` message no matter what the
-link underneath can actually carry. Its receiver then rejects any peer whose
-advertised batch size is not exactly equal to its own:
-
-```c
-/* zenoh-pico src/transport/multicast/rx.c */
-if ((msg->_seq_num_res != Z_SN_RESOLUTION) || (msg->_req_id_res != Z_REQ_RESOLUTION) ||
-    (msg->_batch_size != Z_BATCH_MULTICAST_SIZE)) {
-    _Z_INFO("Couldn't accept peer because distant node is incompatible config wise.");
-```
-
-This link advertises `min(configured batch size, link MTU)`, which on CAN FD is
-63. A stock zenoh-pico advertises 2048, so the two never associate -- and the
-symptom is that single log line on the pico side and nothing at all on this one.
-
-Build zenoh-pico with its multicast batch set to the CAN MTU:
-
-```sh
-cmake -S <zenoh-pico> -B build -DZ_FEATURE_LINK_CAN=1 -DBATCH_MULTICAST_SIZE=63
-```
-
-Then, with `vcan0` up and the two peers on different identifiers:
-
-```sh
-# zenoh-pico subscriber
-build/examples/z_sub -m peer -k 'demo/example/**'     -l 'can/vcan0#bitrate=500000;dbitrate=2000000;id=0x200;match=0;mask=0'
-
-# zenoh-rs publisher
-cargo run -p zenoh-examples --features zenoh/transport_can --example z_pub --     -m peer -l 'can/vcan0#id=0x100' --no-multicast-scouting -k 'demo/example/from-rust'
-```
-
-Note the pico side must use `-l` (listen), never `-e` (connect): its CAN link
-registers in `_z_listen_link` only, because a bus has no connection setup.
+The kernel clamps the request to `net.core.rmem_max` without saying so, so the link reads the value back and warns when it fell short.
 
 ### Testing without hardware
 
@@ -111,16 +104,10 @@ ci/vcan-setup.sh --status     # report, changing nothing
 ci/vcan-setup.sh --down       # tear it down again
 ```
 
-which is the equivalent of:
+or, with no root, inside a user and network namespace of your own:
 
 ```sh
-sudo modprobe vcan
-sudo ip link add dev vcan0 type vcan
-sudo ip link set up vcan0
+unshare -rn sh -c 'ip link add dev vcan0 type vcan && ip link set vcan0 mtu 72 && ip link set vcan0 up && exec <your test>'
 ```
 
-`candump -td vcan0` then shows every frame. The end-to-end tests live in `io/zenoh-transport/tests/multicast_can.rs` and are `#[ignore]`d, so run them deliberately:
-
-```sh
-cargo test -p zenoh-transport --features transport_can --test multicast_can -- --ignored --nocapture
-```
+`mtu 72` is what makes a vcan an FD interface.

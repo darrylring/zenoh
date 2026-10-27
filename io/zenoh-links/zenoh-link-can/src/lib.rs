@@ -18,28 +18,37 @@
 //!
 //! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 //!
-//! A CAN and CAN FD link, interoperating with the zenoh-pico link of the same
-//! wire format.
+//! A CAN FD link, interoperating with the zenoh-pico link of the same wire
+//! format (see [`frame`] for it).
 //!
 //! A CAN bus is a broadcast medium: every node hears every frame and filters by
-//! identifier. That makes this a **multicast** link, not a unicast one. Each
-//! peer owns one identifier, transmits on it, accepts frames from every other
-//! identifier the mask admits, and drops its own. The sender's identifier is
-//! that peer's address.
+//! identifier, and the link builds both kinds of link on that.
 //!
-//! CAN frames are bounded and self-delimiting, so the link is a **datagram**
-//! link: zenoh's own transport fragments anything larger than the MTU, and the
-//! link never needs segmentation or reassembly of its own.
+//! * A **unicast** link -- the default -- talks to one node, `peer`. Every frame
+//!   goes to that node and it hears only that node. Connecting to a locator
+//!   makes one; listening on one accepts every node that sends to it, a link
+//!   each, the way a UDP listener does.
+//! * A **multicast** link, selected by `?mode=multicast` on the locator, sends
+//!   every frame to all nodes and hears all of them. It is what zenoh-pico
+//!   opens when it listens on a locator.
+//!
+//! The wire format is the same for both and only the destination differs.
+//!
+//! Frames are segmented and reassembled by the link itself, so it is a
+//! **datagram** link with a 4095-byte MTU, and zenoh's own fragmentation never
+//! runs on it. CAN FD is required: classic CAN is not supported.
 
 mod frame;
 mod multicast;
 #[cfg(target_os = "linux")]
 mod sys;
+mod unicast;
 
 use std::str::FromStr;
 
 use async_trait::async_trait;
 pub use multicast::LinkManagerMulticastCan;
+pub use unicast::LinkManagerUnicastCan;
 use zenoh_link_commons::{LocatorInspector, TCP_SO_RCV_BUF};
 use zenoh_protocol::{
     core::{EndPoint, Locator, Metadata, Reliability},
@@ -54,9 +63,8 @@ pub const CAN_LOCATOR_PREFIX: &str = "can";
 /// everything. zenoh's own reliability covers that.
 const IS_RELIABLE: bool = false;
 
-/// The largest MTU the link can ever report, used before a mode is known.
-/// `open` replaces it with the MTU for the mode actually obtained.
-pub const CAN_MAX_MTU: BatchSize = frame::FD_MTU;
+/// The MTU of the link: the largest datagram it carries.
+pub const CAN_MAX_MTU: BatchSize = frame::MTU;
 
 /// `IFNAMSIZ`, including the terminator.
 const IFNAMSIZ: usize = 16;
@@ -64,50 +72,40 @@ const IFNAMSIZ: usize = 16;
 /// Endpoint configuration keys.
 ///
 /// ```text
-/// can/<device>#bitrate=500000;dbitrate=2000000;id=0x100;match=0;mask=0
+/// can/<device>#bitrate=500000;dbitrate=2000000;id=1;peer=2
 /// ```
 ///
 /// * `device` -- the CAN interface name, e.g. `can0` or `vcan0`
-/// * `bitrate` -- arbitration-phase bit rate; also the sole rate for classic CAN
+/// * `bitrate` -- arbitration-phase bit rate
 /// * `dbitrate` -- CAN FD data-phase bit rate. Must be non-zero: this link is
 ///   CAN FD only
-/// * `id` -- **this** peer's identifier. It transmits on this, and every other
-///   peer sees it as this peer's address
-/// * `match` -- accept frames whose `(id & mask) == match`
-/// * `mask` -- `0`, the default, accepts every identifier on the bus
+/// * `id` -- **this** node, 0..=254. It is the source in every identifier it
+///   sends, and node ids must be unique on the bus
+/// * `peer` -- 0..=254, the one node a unicast link talks to. Required to
+///   connect, and not used to listen
 ///
 /// On Linux the bit rates are advisory: rates are set out of band with
-/// `ip link set can0 type can bitrate ...` and a virtual interface has none at
-/// all. They are still validated, because `dbitrate=0` used to mean classic
-/// CAN and now means a misconfiguration.
+/// `ip link set can0 type can bitrate ... fd on`, and a virtual interface has
+/// none at all. They are still validated, because `dbitrate=0` selects classic
+/// CAN in zenoh-pico and is a misconfiguration here.
+///
+/// The locator itself, before the `#`, takes one key:
+///
+/// * `mode` -- `unicast`, the default, or `multicast`
+///
+/// It has to live there because zenoh decides what kind of link a locator is
+/// from the locator alone, and the configuration after `#` is not part of it.
 ///
 /// # Identifier value is bus priority
 ///
-/// A **lower identifier wins arbitration**, so `id` is a real-time decision and
-/// not a name. The peer that must not be delayed needs the lower identifier: on
-/// a safety island that is the node publishing the stop command, not the one
-/// publishing bulk telemetry.
-///
-/// The defaults below are a starting point, not an allocation. Two peers that
-/// both accept them differ only by whoever was configured first, which is a
-/// priority ordering nobody chose.
-///
-/// Priority is also per **peer**, not per message: one identifier carries all of
-/// a peer's traffic.
+/// The identifier is the bus priority as well as the address: the lowest wins
+/// arbitration, and zenoh's own priority sits in its high bits, so an urgent
+/// message beats a bulk one on the wire regardless of which node sent it.
 pub mod config {
     pub const BITRATE: &str = "bitrate";
     pub const DBITRATE: &str = "dbitrate";
     pub const ID: &str = "id";
-    pub const MATCH: &str = "match";
-    pub const MASK: &str = "mask";
-    /// Width of the traffic-class field in the identifier, 0..=3.
-    ///
-    /// `0`, the default, is the wire zenoh-pico speaks: the identifier is the
-    /// peer and nothing else. Above 0 the top `prio_bits` bits carry zenoh's
-    /// message priority so that an urgent message wins bus arbitration against
-    /// a bulk one -- including one from the same peer. Both ends of a bus must
-    /// agree on this, and it costs peer address space.
-    pub const PRIO_BITS: &str = "prio_bits";
+    pub const PEER: &str = "peer";
     /// Receive buffer size in bytes, spelled as the TCP and UDP links spell it.
     ///
     /// Absent, the kernel default applies. Raising it matters only when frames
@@ -115,15 +113,16 @@ pub mod config {
     /// -- 2 Mbit/s of CAN FD is under 2 800 frames per second -- but a virtual
     /// interface can, because it has no bit rate at all. See the README.
     pub use zenoh_link_commons::TCP_SO_RCV_BUF as SO_RCVBUF;
+
+    /// The locator metadata key naming the kind of link.
+    pub const MODE: &str = "mode";
+    pub const MODE_UNICAST: &str = "unicast";
+    pub const MODE_MULTICAST: &str = "multicast";
 }
 
 pub const DEFAULT_BITRATE: u32 = 500_000;
 pub const DEFAULT_DBITRATE: u32 = 2_000_000;
-pub const DEFAULT_ID: u32 = 0x100;
-pub const DEFAULT_MATCH: u32 = 0;
-pub const DEFAULT_MASK: u32 = 0;
-/// Off. The identifier is the peer, which is what zenoh-pico expects.
-pub const DEFAULT_PRIO_BITS: u8 = 0;
+pub const DEFAULT_ID: u8 = 1;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CanLocatorInspector;
@@ -134,11 +133,18 @@ impl LocatorInspector for CanLocatorInspector {
         CAN_LOCATOR_PREFIX
     }
 
-    /// Always. A CAN bus is a broadcast medium, and declaring otherwise routes
-    /// the listen side through the unicast accept path, which needs a socket
-    /// and an `accept()` that no datagram medium has.
-    async fn is_multicast(&self, _locator: &Locator) -> ZResult<bool> {
-        Ok(true)
+    /// Whether the locator asks for `mode=multicast`. Otherwise it is unicast,
+    /// which is what zenoh-pico opens when it connects to a locator.
+    async fn is_multicast(&self, locator: &Locator) -> ZResult<bool> {
+        match locator.metadata().get(config::MODE) {
+            None | Some(config::MODE_UNICAST) => Ok(false),
+            Some(config::MODE_MULTICAST) => Ok(true),
+            Some(other) => bail!(
+                "unknown CAN link mode {other:?} in {locator}; expected `{}` or `{}`",
+                config::MODE_UNICAST,
+                config::MODE_MULTICAST
+            ),
+        }
     }
 
     fn is_reliable(&self, locator: &Locator) -> ZResult<bool> {
@@ -166,22 +172,21 @@ pub(crate) struct CanEndpoint {
     pub(crate) device: String,
     pub(crate) bitrate: u32,
     pub(crate) dbitrate: u32,
-    pub(crate) id: u32,
-    pub(crate) filter_match: u32,
-    pub(crate) filter_mask: u32,
+    /// This node.
+    pub(crate) id: u8,
+    /// The node a unicast link talks to.
+    pub(crate) peer: Option<u8>,
     /// `None` leaves the kernel default in place.
     pub(crate) so_rcvbuf: Option<u32>,
-    /// Width of the traffic-class field. 0 disables priority mapping.
-    pub(crate) prio_bits: u8,
 }
 
 /// Parse an unsigned integer, accepting decimal and `0x`-prefixed hex.
 ///
-/// Identifiers are conventionally written in hex and bit rates in decimal, and
+/// Node ids are conventionally written in either and bit rates in decimal, and
 /// forcing one notation on both would make every endpoint harder to read.
 ///
 /// Unlike the zenoh-pico parser, a malformed value is an error rather than a
-/// silent fall back to the default: a mistyped identifier is a priority
+/// silent fall back to the default: a mistyped node id is an addressing
 /// misconfiguration, and those must not be quiet.
 fn parse_u32(key: &str, s: &str) -> ZResult<u32> {
     let t = s.trim();
@@ -207,6 +212,18 @@ fn get_opt_u32(endpoint: &EndPoint, key: &str) -> ZResult<Option<u32>> {
         .get(key)
         .map(|v| parse_u32(key, v))
         .transpose()
+}
+
+/// A node id: 0..=254, since 0xFF is everybody.
+fn node(key: &str, value: u32) -> ZResult<u8> {
+    match u8::try_from(value) {
+        Ok(n) if n <= frame::NODE_MAX => Ok(n),
+        _ => bail!(
+            "CAN `{key}` is {value}, outside the node range 0..={}: {:#x} is the broadcast address",
+            frame::NODE_MAX,
+            frame::NODE_BROADCAST
+        ),
+    }
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -235,120 +252,84 @@ impl CanEndpoint {
             );
         }
 
+        let id = node(
+            config::ID,
+            get_u32(endpoint, config::ID, DEFAULT_ID as u32)?,
+        )?;
+        let peer = get_opt_u32(endpoint, config::PEER)?
+            .map(|p| node(config::PEER, p))
+            .transpose()?;
+
         let ep = CanEndpoint {
             device,
             bitrate: get_u32(endpoint, config::BITRATE, DEFAULT_BITRATE)?,
             dbitrate: get_u32(endpoint, config::DBITRATE, DEFAULT_DBITRATE)?,
-            id: get_u32(endpoint, config::ID, DEFAULT_ID)?,
-            filter_match: get_u32(endpoint, config::MATCH, DEFAULT_MATCH)?,
-            filter_mask: get_u32(endpoint, config::MASK, DEFAULT_MASK)?,
+            id,
+            peer,
             so_rcvbuf: get_opt_u32(endpoint, TCP_SO_RCV_BUF)?,
-            prio_bits: get_u32(endpoint, config::PRIO_BITS, DEFAULT_PRIO_BITS as u32)? as u8,
         };
         ep.validate()?;
         Ok(ep)
     }
 
     fn validate(&self) -> ZResult<()> {
-        // This link is CAN FD only. `dbitrate=0` used to select classic CAN,
-        // whose 7-byte MTU is smaller than zenoh's per-fragment overhead, so a
-        // classic link could never carry a session. Refusing beats shipping a
-        // mode whose only symptom is a hang.
+        // This link is CAN FD only. In zenoh-pico `dbitrate=0` selects classic
+        // CAN, whose 8-byte frames this link neither sends nor hears, so a
+        // locator asking for it would open a link that could never talk to
+        // anyone. Refusing beats a hang.
         if self.dbitrate == 0 {
             bail!(
-                "CAN `{}` is 0, which selected classic CAN. This link is CAN FD only: a \
-                 7-byte MTU is smaller than zenoh's per-fragment overhead, so no session \
-                 could make progress. Set a data-phase bit rate, e.g. `{}=2000000`",
+                "CAN `{}` is 0, which selects classic CAN in zenoh-pico. This link is CAN FD                  only: set a data-phase bit rate, e.g. `{}=2000000`",
                 config::DBITRATE,
                 config::DBITRATE
             );
         }
 
-        if self.prio_bits > frame::PRIO_BITS_MAX {
+        if self.peer == Some(self.id) {
             bail!(
-                "CAN `{}` is {}, but zenoh has 8 priorities so at most {} bits are useful",
-                config::PRIO_BITS,
-                self.prio_bits,
-                frame::PRIO_BITS_MAX
-            );
-        }
-
-        // Only 11-bit identifiers are expressible: the sender never sets
-        // CAN_EFF_FLAG, so a larger value would silently become a different
-        // identifier on the wire. Traffic-class bits come
-        // out of that same 11, so they shrink the peer space.
-        let max_peer = frame::max_peer_id(self.prio_bits);
-        for (key, value) in [
-            (config::ID, self.id),
-            (config::MATCH, self.filter_match),
-            (config::MASK, self.filter_mask),
-        ] {
-            if value > max_peer {
-                if self.prio_bits == 0 {
-                    bail!(
-                        "CAN `{key}` is {value:#x}, above the 11-bit maximum {max_peer:#x}; \
-                         extended identifiers are not part of this wire format"
-                    );
-                }
-                bail!(
-                    "CAN `{key}` is {value:#x}, but `{}={}` reserves the top {} bits of the \
-                     identifier for the traffic class, leaving {max_peer:#x} for the peer",
-                    config::PRIO_BITS,
-                    self.prio_bits,
-                    self.prio_bits
-                );
-            }
-        }
-
-        // A peer that filtered out its own identifier would never be reachable
-        // by anyone, which is a configuration error rather than a quiet
-        // degradation.
-        if self.filter_mask != 0 && (self.id & self.filter_mask) != self.filter_match {
-            bail!(
-                "CAN `id` {:#x} lies outside its own `match`/`mask` band ({:#x}/{:#x}), \
-                 so no peer could address it",
-                self.id,
-                self.filter_match,
-                self.filter_mask
+                "CAN `{}` is this node's own id {}: a link cannot talk to itself",
+                config::PEER,
+                self.id
             );
         }
 
         Ok(())
     }
 
-    /// The locator naming a peer on this bus, which is how the multicast
-    /// transport tells peers apart. Derived locally from the frame identifier
-    /// and never transmitted.
-    ///
-    /// The identifier goes in the locator's **metadata**, not its config: a
-    /// `Locator` is an `EndPoint` with the config truncated away
-    /// (`From<EndPoint> for Locator`), so a config-borne identifier would be
-    /// silently dropped and every peer would look alike.
-    pub(crate) fn peer_locator(&self, id: u32) -> Locator {
-        Locator::new(
-            CAN_LOCATOR_PREFIX,
-            &self.device,
-            format!("{}={:#x}", config::ID, id),
-        )
-        .expect("a CAN peer locator is always well formed")
+    /// The node a unicast link talks to, or an error that says so.
+    pub(crate) fn require_peer(&self) -> ZResult<u8> {
+        match self.peer {
+            Some(peer) => Ok(peer),
+            None => bail!(
+                "a CAN unicast link needs `{}=<node>` to say who it talks to; to talk to \
+                 everybody use `?{}={}` on the locator",
+                config::PEER,
+                config::MODE,
+                config::MODE_MULTICAST
+            ),
+        }
     }
 
-    /// The locator naming the identifier band this link listens to, which is
-    /// what the transport manager keys the multicast transport by. Metadata
-    /// rather than config, for the same reason as [`Self::peer_locator`].
-    pub(crate) fn group_locator(&self) -> Locator {
+    /// The locator naming a node on this bus. Derived locally from the frame
+    /// identifier and never transmitted.
+    ///
+    /// The id goes in the locator's **metadata**, not its config: a `Locator`
+    /// is an `EndPoint` with the config truncated away (`From<EndPoint> for
+    /// Locator`), so a config-borne id would be silently dropped and every node
+    /// would look alike.
+    pub(crate) fn node_locator(&self, node: u8) -> Locator {
         Locator::new(
             CAN_LOCATOR_PREFIX,
             &self.device,
-            format!(
-                "{}={:#x};{}={:#x}",
-                config::MATCH,
-                self.filter_match,
-                config::MASK,
-                self.filter_mask
-            ),
+            format!("{}={}", config::ID, node),
         )
-        .expect("a CAN group locator is always well formed")
+        .expect("a CAN node locator is always well formed")
+    }
+
+    /// The locator naming everybody on this bus, the destination of a
+    /// multicast link.
+    pub(crate) fn broadcast_locator(&self) -> Locator {
+        self.node_locator(frame::NODE_BROADCAST)
     }
 }
 
@@ -367,57 +348,27 @@ mod tests {
         assert_eq!(c.bitrate, DEFAULT_BITRATE);
         assert_eq!(c.dbitrate, DEFAULT_DBITRATE);
         assert_eq!(c.id, DEFAULT_ID);
-        assert_eq!(c.filter_match, DEFAULT_MATCH);
-        assert_eq!(c.filter_mask, DEFAULT_MASK);
+        assert_eq!(c.peer, None);
     }
 
     #[test]
     fn the_full_grammar_parses() {
         let c = CanEndpoint::parse(&ep(
-            "can/can0#bitrate=500000;dbitrate=2000000;id=0x101;match=0x100;mask=0x700",
+            "can/can0#bitrate=500000;dbitrate=2000000;id=0x0A;peer=2",
         ))
         .unwrap();
         assert_eq!(c.device, "can0");
-        assert_eq!(c.id, 0x101);
-        assert_eq!(c.filter_match, 0x100);
-        assert_eq!(c.filter_mask, 0x700);
+        assert_eq!(c.id, 10);
+        assert_eq!(c.peer, Some(2));
     }
 
     #[test]
     fn decimal_and_hex_are_both_accepted() {
-        let c = CanEndpoint::parse(&ep("can/vcan0#id=257")).unwrap();
-        assert_eq!(c.id, 0x101);
-    }
-
-    #[test]
-    fn priority_bits_default_to_off() {
+        assert_eq!(CanEndpoint::parse(&ep("can/vcan0#id=17")).unwrap().id, 0x11);
         assert_eq!(
-            CanEndpoint::parse(&ep("can/vcan0")).unwrap().prio_bits,
-            DEFAULT_PRIO_BITS
+            CanEndpoint::parse(&ep("can/vcan0#id=0x11")).unwrap().id,
+            0x11
         );
-        assert_eq!(
-            CanEndpoint::parse(&ep("can/vcan0#id=0x0A;prio_bits=3"))
-                .unwrap()
-                .prio_bits,
-            3
-        );
-    }
-
-    #[test]
-    fn too_many_priority_bits_are_refused() {
-        let e = CanEndpoint::parse(&ep("can/vcan0#id=0x0A;prio_bits=4")).unwrap_err();
-        assert!(e.to_string().contains("at most 3 bits"), "{e}");
-    }
-
-    /// The class field eats peer space, and an id that no longer fits has to
-    /// say so rather than silently colliding with another class.
-    #[test]
-    fn an_id_that_no_longer_fits_is_refused_with_the_budget() {
-        let e = CanEndpoint::parse(&ep("can/vcan0#id=0x101;prio_bits=3")).unwrap_err();
-        assert!(e.to_string().contains("reserves the top 3 bits"), "{e}");
-        assert!(e.to_string().contains("0xff"), "{e}");
-        // The same id is fine with two class bits, which leave 9 for the peer.
-        assert!(CanEndpoint::parse(&ep("can/vcan0#id=0x101;prio_bits=2")).is_ok());
     }
 
     #[test]
@@ -436,25 +387,17 @@ mod tests {
     }
 
     /// Classic CAN is refused, and the message says why rather than leaving
-    /// someone to discover a 7-byte MTU at runtime.
+    /// someone to wonder why nothing arrives.
     #[test]
     fn a_zero_dbitrate_is_refused() {
         let e = CanEndpoint::parse(&ep("can/vcan0#dbitrate=0")).unwrap_err();
-        assert!(e.to_string().contains("CAN FD only"), "{e}");
+        assert!(e.to_string().contains("CAN FD"), "{e}");
     }
 
     #[test]
     fn a_malformed_value_is_an_error_not_a_default() {
-        let e = CanEndpoint::parse(&ep("can/vcan0#id=0x10g")).unwrap_err();
+        let e = CanEndpoint::parse(&ep("can/vcan0#id=0x1g")).unwrap_err();
         assert!(e.to_string().contains("invalid `id` value"), "{e}");
-    }
-
-    #[test]
-    fn an_empty_interface_name_is_refused() {
-        // zenoh's own endpoint parser rejects an empty address before the link
-        // ever sees it. The link keeps its own guard for callers that build an
-        // EndPoint by some other route.
-        assert!(EndPoint::from_str("can/").is_err());
     }
 
     #[test]
@@ -464,64 +407,90 @@ mod tests {
     }
 
     #[test]
-    fn extended_identifiers_are_refused_with_a_reason() {
-        let e = CanEndpoint::parse(&ep("can/vcan0#id=0x800")).unwrap_err();
-        assert!(e.to_string().contains("11-bit maximum"), "{e}");
+    fn the_broadcast_address_is_not_a_node() {
+        for s in [
+            "can/vcan0#id=255",
+            "can/vcan0#id=0x100",
+            "can/vcan0#peer=255",
+        ] {
+            let e = CanEndpoint::parse(&ep(s)).unwrap_err();
+            assert!(e.to_string().contains("0..=254"), "{s}: {e}");
+        }
+        assert!(CanEndpoint::parse(&ep("can/vcan0#id=254;peer=0")).is_ok());
     }
 
     #[test]
-    fn an_id_outside_its_own_band_is_refused() {
-        let e = CanEndpoint::parse(&ep("can/vcan0#id=0x201;match=0x100;mask=0x700")).unwrap_err();
-        assert!(e.to_string().contains("outside its own"), "{e}");
+    fn a_node_cannot_be_its_own_peer() {
+        let e = CanEndpoint::parse(&ep("can/vcan0#id=3;peer=3")).unwrap_err();
+        assert!(e.to_string().contains("talk to itself"), "{e}");
     }
 
     #[test]
-    fn an_id_inside_its_own_band_is_accepted() {
-        assert!(CanEndpoint::parse(&ep("can/vcan0#id=0x101;match=0x100;mask=0x700")).is_ok());
+    fn a_unicast_link_without_a_peer_says_what_to_do() {
+        let c = CanEndpoint::parse(&ep("can/vcan0#id=3")).unwrap();
+        let e = c.require_peer().unwrap_err();
+        assert!(e.to_string().contains("peer="), "{e}");
+        assert!(e.to_string().contains("mode=multicast"), "{e}");
+        let c = CanEndpoint::parse(&ep("can/vcan0#id=3;peer=4")).unwrap();
+        assert_eq!(c.require_peer().unwrap(), 4);
     }
 
     #[test]
-    fn a_peer_locator_carries_the_sender_identifier() {
+    fn a_node_locator_carries_the_node() {
         let c = CanEndpoint::parse(&ep("can/vcan0")).unwrap();
-        let l = c.peer_locator(0x101);
+        let l = c.node_locator(0x11);
         assert_eq!(l.protocol().as_str(), CAN_LOCATOR_PREFIX);
         assert_eq!(l.address().as_str(), "vcan0");
-        assert_eq!(l.metadata().get(config::ID), Some("0x101"));
+        assert_eq!(l.metadata().get(config::ID), Some("17"));
     }
 
-    /// The multicast transport tells peers apart by comparing these locators,
-    /// so two identifiers must never produce the same one.
+    /// Links are told apart by comparing these locators, so two nodes must
+    /// never produce the same one.
     #[test]
-    fn peer_locators_distinguish_peers() {
+    fn node_locators_distinguish_nodes() {
         let c = CanEndpoint::parse(&ep("can/vcan0")).unwrap();
-        assert_ne!(c.peer_locator(0x100), c.peer_locator(0x101));
+        assert_ne!(c.node_locator(1), c.node_locator(2));
+        assert_ne!(c.node_locator(1), c.broadcast_locator());
     }
 
     /// A `Locator` is an `EndPoint` with the config truncated, which is why the
-    /// identifier lives in the metadata. This pins that reasoning: had it gone
-    /// in the config, it would vanish here.
+    /// node lives in the metadata. This pins that reasoning: had it gone in the
+    /// config, it would vanish here.
     #[test]
-    fn a_config_borne_identifier_would_be_lost() {
-        let e = ep("can/vcan0#id=0x101");
-        assert_eq!(e.config().get(config::ID), Some("0x101"));
+    fn a_config_borne_node_would_be_lost() {
+        let e = ep("can/vcan0#id=17");
+        assert_eq!(e.config().get(config::ID), Some("17"));
         assert_eq!(e.to_locator().metadata().get(config::ID), None);
     }
 
-    /// Bands differ, so the transports keyed by them differ.
-    #[test]
-    fn group_locators_distinguish_bands() {
-        let a = CanEndpoint::parse(&ep("can/vcan0#id=0x101;match=0x100;mask=0x700")).unwrap();
-        let b = CanEndpoint::parse(&ep("can/vcan0#id=0x201;match=0x200;mask=0x700")).unwrap();
-        assert_ne!(a.group_locator(), b.group_locator());
-        assert_eq!(a.group_locator().address().as_str(), "vcan0");
+    #[tokio::test]
+    async fn the_inspector_reads_the_mode_from_the_locator() {
+        let i = CanLocatorInspector;
+        assert_eq!(i.protocol(), "can");
+        let unicast = Locator::from_str("can/vcan0").unwrap();
+        let explicit = Locator::from_str("can/vcan0?mode=unicast").unwrap();
+        let multicast = Locator::from_str("can/vcan0?mode=multicast").unwrap();
+        assert!(!i.is_multicast(&unicast).await.unwrap());
+        assert!(!i.is_multicast(&explicit).await.unwrap());
+        assert!(i.is_multicast(&multicast).await.unwrap());
+        assert!(!i.is_reliable(&unicast).unwrap());
+    }
+
+    /// The mode is the locator's, so the configuration after `#` cannot change
+    /// it, and an endpoint with both reads as the locator says.
+    #[tokio::test]
+    async fn the_mode_survives_the_endpoint_becoming_a_locator() {
+        let e = ep("can/vcan0?mode=multicast#id=3");
+        assert!(CanLocatorInspector
+            .is_multicast(&e.to_locator())
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
-    async fn the_inspector_reports_a_multicast_best_effort_link() {
-        let i = CanLocatorInspector;
-        let l = Locator::from_str("can/vcan0").unwrap();
-        assert_eq!(i.protocol(), "can");
-        assert!(i.is_multicast(&l).await.unwrap());
-        assert!(!i.is_reliable(&l).unwrap());
+    async fn an_unknown_mode_is_refused() {
+        let l = Locator::from_str("can/vcan0?mode=anycast").unwrap();
+        let e = CanLocatorInspector.is_multicast(&l).await.unwrap_err();
+        assert!(e.to_string().contains("unknown CAN link mode"), "{e}");
     }
 }
