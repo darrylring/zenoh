@@ -20,9 +20,13 @@
 //! what answers.
 //!
 //! The ids it hands out are only for the link. Who a device is, is for the
-//! protocol above to say, so an id need not be the same one next time, and a
-//! device that asks again, with the same UID, gets the id it was given if that
-//! is still held.
+//! protocol above to say, so an id need not be the same one next time. A device
+//! that asks again, with the same UID, gets the id it was given only while that
+//! id has not been used: the request was repeated because the answer was lost.
+//! Once the device has sent anything from it, a request is a device that has
+//! started again, and it gets a new id, because the old one still has a link
+//! bound to it here. That link would take the new session's first frames, and
+//! the session would never start.
 //!
 //! No node is told that an id has been given up. An id is free again when
 //! nothing has been heard from it for a while, whoever it was given to, which
@@ -49,6 +53,8 @@ pub(crate) struct Allocator {
     ttl: Duration,
     /// When each id was last heard from, or given out.
     seen: [Option<Instant>; NODE_MAX as usize + 1],
+    /// Whether anything has been heard from each id since it was given out.
+    used: [bool; NODE_MAX as usize + 1],
     /// Who each given id went to.
     uids: HashMap<Uid, u8>,
 }
@@ -59,6 +65,7 @@ impl Allocator {
             own,
             ttl,
             seen: [None; NODE_MAX as usize + 1],
+            used: [false; NODE_MAX as usize + 1],
             uids: HashMap::new(),
         }
     }
@@ -67,19 +74,26 @@ impl Allocator {
     pub(crate) fn observe(&mut self, src: u8, now: Instant) {
         if let Some(slot) = self.seen.get_mut(src as usize) {
             *slot = Some(now);
+            self.used[src as usize] = true;
         }
     }
 
-    /// The id for the node with this UID: the one it has, or else the lowest
-    /// that is free. None when they are all in use.
+    /// The id for the node with this UID: the one it was given, if nothing has
+    /// been heard from it yet, or else the lowest that is free. None when they
+    /// are all in use.
     pub(crate) fn assign(&mut self, uid: Uid, now: Instant) -> Option<u8> {
         self.expire(now);
         if let Some(&id) = self.uids.get(&uid) {
-            self.seen[id as usize] = Some(now);
-            return Some(id);
+            if !self.used[id as usize] {
+                self.seen[id as usize] = Some(now);
+                return Some(id);
+            }
+            // It has started again. Its old id stays held until it has been quiet for a while
+            self.uids.remove(&uid);
         }
         let id = (0..=NODE_MAX).find(|&id| id != self.own && self.seen[id as usize].is_none())?;
         self.seen[id as usize] = Some(now);
+        self.used[id as usize] = false;
         self.uids.insert(uid, id);
         Some(id)
     }
@@ -116,12 +130,41 @@ mod tests {
     }
 
     #[test]
-    fn asking_again_gets_the_same_id() {
+    fn asking_again_before_using_the_id_gets_the_same_one() {
         let now = Instant::now();
         let mut a = Allocator::new(1, TTL);
         let first = a.assign(uid(10), now);
         a.assign(uid(11), now);
+        // The answer was lost, so the request is repeated
         assert_eq!(a.assign(uid(10), now), first);
+    }
+
+    #[test]
+    fn a_node_that_has_started_again_gets_a_new_id() {
+        let now = Instant::now();
+        let mut a = Allocator::new(1, TTL);
+        let first = a.assign(uid(10), now).unwrap();
+        // It used its id, then stopped and started again, with the same UID
+        a.observe(first, now);
+        let second = a.assign(uid(10), now).unwrap();
+        assert_ne!(first, second, "the old id still has a link here");
+        // And the same again
+        a.observe(second, now);
+        let third = a.assign(uid(10), now).unwrap();
+        assert!(third != first && third != second);
+    }
+
+    #[test]
+    fn the_old_id_of_a_node_that_started_again_is_free_when_it_has_been_quiet() {
+        let now = Instant::now();
+        let mut a = Allocator::new(1, TTL);
+        let first = a.assign(uid(10), now).unwrap();
+        a.observe(first, now);
+        let second = a.assign(uid(10), now).unwrap();
+        a.observe(second, now + TTL / 2);
+        // Only the second is kept up
+        let later = now + TTL;
+        assert_eq!(a.assign(uid(11), later), Some(first));
     }
 
     #[test]
@@ -155,8 +198,8 @@ mod tests {
             t += TTL / 2;
             a.observe(0, t);
         }
+        // Still held, so not given to someone else
         assert_eq!(a.assign(uid(11), t), Some(2));
-        assert_eq!(a.assign(uid(10), t), Some(0));
     }
 
     #[test]

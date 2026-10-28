@@ -56,7 +56,7 @@ z_pub -m client -e 'can/can0#peer=1' ...
 
 The request goes from the **unassigned** address (254) and carries the device's UID. The answer goes to that address with the UID and the id given, and the device then opens the link as that node. Both are single, urgent frames (identifier kind 1 and 2, in the bits that were reserved). The key field of a request carries five bits of the UID's hash, so that two devices that ask at the same moment do not send one identifier with different data, which a bus does not survive. Devices wait a random few milliseconds before asking, which makes that rare.
 
-The ids are only for the link, so they need not be the same next time. A device that asks again with the same UID gets the id it has, while it is still held. An id is free again when nothing has been heard from it for 30 seconds, whoever it was given to. That also keeps an id from being handed to a node whose id was set by hand with `id=`.
+The ids are only for the link, so they need not be the same next time. A device that asks again with the same UID gets the id it was given only if it has not used it yet: then the request is a repeat because the answer was lost. Once it has sent anything from that id, a new request is a device that has started again, and it gets a **different** id, because the router still has a link bound to the old one, and that link would take the new session's first frames. An id is free again when nothing has been heard from it for 30 seconds, whoever it was given to. That also keeps an id from being handed to a node whose id was set by hand with `id=`.
 
 Ids 0..=253 are for nodes, 254 is the unassigned address and 255 is everybody.
 
