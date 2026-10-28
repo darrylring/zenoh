@@ -64,6 +64,7 @@ use zenoh_protocol::transport::BatchSize;
 
 pub(crate) const SRC_SHIFT: u32 = 0;
 pub(crate) const DST_SHIFT: u32 = 8;
+pub(crate) const KIND_SHIFT: u32 = 16;
 pub(crate) const KEY_SHIFT: u32 = 21;
 pub(crate) const PRIO_SHIFT: u32 = 26;
 
@@ -71,10 +72,28 @@ pub(crate) const NODE_MASK: u32 = 0xFF;
 /// The destination of multicast frames.
 pub(crate) const NODE_BROADCAST: u8 = 0xFF;
 const KEY_MASK: u32 = 0x1F;
+const KIND_MASK: u32 = 0x1F;
 const PRIO_MASK: u32 = 0x07;
 
-/// The highest node id a link may use: 0xFF is the broadcast address.
-pub(crate) const NODE_MAX: u8 = 0xFE;
+/// The source of a node that has no id yet, which is asking for one. The
+/// highest address a node may be given is the one below it.
+pub(crate) const NODE_UNASSIGNED: u8 = 0xFE;
+
+/// The highest node id a link may use: 0xFF is the broadcast address and 0xFE
+/// is the unassigned one.
+pub(crate) const NODE_MAX: u8 = 0xFD;
+
+/// What an identifier's reserved bits (20..16) say the frame is. Ordinary
+/// data is zero, so a frame is data unless it says otherwise.
+pub(crate) const KIND_DATA: u8 = 0;
+/// A node without an id asking the router for one. The payload is its UID.
+pub(crate) const KIND_ID_REQUEST: u8 = 1;
+/// The router's answer, to the unassigned address: the UID that asked and the
+/// id it is given.
+pub(crate) const KIND_ID_ASSIGN: u8 = 2;
+
+/// The length of a node's unique id, as the chip gives it.
+pub(crate) const UID_LEN: usize = 12;
 
 /// zenoh's `Priority::Data`, which is what pico sends everything at.
 pub(crate) const PRIO_DEFAULT: u8 = 5;
@@ -129,11 +148,28 @@ pub(crate) const fn make_id(prio: u8, key: u8, dst: u8, src: u8) -> u32 {
         | ((src as u32 & NODE_MASK) << SRC_SHIFT)
 }
 
+/// The identifier a control frame goes out under. These are urgent (priority
+/// 0), and the key field carries a few bits of the UID's hash. That is what
+/// stops two nodes that start asking at the same moment from sending the same
+/// identifier with different data, which a bus does not survive.
+pub(crate) const fn make_ctl_id(kind: u8, key: u8, dst: u8, src: u8) -> u32 {
+    make_id(0, key, dst, src) | ((kind as u32 & KIND_MASK) << KIND_SHIFT)
+}
+
+/// What a frame is: [`KIND_DATA`] or a control message.
+pub(crate) const fn id_kind(id: u32) -> u8 {
+    ((id >> KIND_SHIFT) & KIND_MASK) as u8
+}
+
+/// Five bits of a UID, for the key field of its requests.
+pub(crate) fn uid_key(uid: &[u8; UID_LEN]) -> u8 {
+    uid.iter().fold(0u8, |h, b| h.rotate_left(3) ^ b) & KEY_MASK as u8
+}
+
 pub(crate) const fn id_src(id: u32) -> u8 {
     ((id >> SRC_SHIFT) & NODE_MASK) as u8
 }
 
-#[cfg(test)]
 pub(crate) const fn id_dst(id: u32) -> u8 {
     ((id >> DST_SHIFT) & NODE_MASK) as u8
 }
@@ -643,6 +679,25 @@ mod tests {
 
     /// Without the flag the kernel sends a standard frame with the identifier
     /// cut to 11 bits, and nothing zenoh-pico filters on would match.
+    #[test]
+    fn a_control_identifier_carries_its_kind_and_leaves_the_rest() {
+        let id = make_ctl_id(KIND_ID_REQUEST, 0x15, 3, NODE_UNASSIGNED);
+        assert_eq!(id_kind(id), KIND_ID_REQUEST);
+        assert_eq!(id_dst(id), 3);
+        assert_eq!(id_src(id), NODE_UNASSIGNED);
+        assert_eq!(id >> PRIO_SHIFT, 0, "urgent");
+        assert_eq!(id_kind(make_id(5, 0, 3, 4)), KIND_DATA);
+    }
+
+    #[test]
+    fn the_uid_key_fits_the_key_field_and_tells_uids_apart() {
+        let a = [0xA5u8; UID_LEN];
+        let mut b = a;
+        b[UID_LEN - 1] ^= 1;
+        assert!(uid_key(&a) <= KEY_MASK as u8);
+        assert_ne!(uid_key(&a), uid_key(&b));
+    }
+
     #[test]
     fn every_frame_is_an_extended_identifier_frame() {
         for f in encode(&datagram(500), make_id(5, 0, 2, 1), 0).unwrap() {

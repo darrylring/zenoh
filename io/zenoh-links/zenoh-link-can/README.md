@@ -42,6 +42,24 @@ z_pub -m client -e 'can/can0#id=2;peer=1' ...
 
 A pico peer that **listens** on `can/can0#id=2` is a multicast link, and talks to a Rust peer on `can/can0?mode=multicast#id=1`. Multicast peers must agree on the batch size, which zenoh-pico takes from `Z_BATCH_MULTICAST_SIZE` (2048 by default) and advertises as is, and which this link advertises as the smaller of zenoh's configured batch size and 4095. Make them equal: build pico with a `BATCH_MULTICAST_SIZE` that matches, or set `transport/link/tx/batch_size` here.
 
+### Node ids
+
+A device's unique id (96 bits) is far too long to address it on a bus, so a zenoh-pico node that connects with no `id` asks the node it connects to for one, and a listening unicast link here answers. Nothing is configured on either side:
+
+```sh
+# the router, node 1: it answers requests for ids
+zenohd -l can/can0#id=1
+
+# a device, which asks node 1 for an id before it opens its session
+z_pub -m client -e 'can/can0#peer=1' ...
+```
+
+The request goes from the **unassigned** address (254) and carries the device's UID. The answer goes to that address with the UID and the id given, and the device then opens the link as that node. Both are single, urgent frames (identifier kind 1 and 2, in the bits that were reserved). The key field of a request carries five bits of the UID's hash, so that two devices that ask at the same moment do not send one identifier with different data, which a bus does not survive. Devices wait a random few milliseconds before asking, which makes that rare.
+
+The ids are only for the link, so they need not be the same next time. A device that asks again with the same UID gets the id it has, while it is still held. An id is free again when nothing has been heard from it for 30 seconds, whoever it was given to. That also keeps an id from being handed to a node whose id was set by hand with `id=`.
+
+Ids 0..=253 are for nodes, 254 is the unassigned address and 255 is everybody.
+
 ### Endpoints
 
 ```text
@@ -54,8 +72,8 @@ can/<device>?mode=multicast#id=1
 | `device` | the CAN interface name, such as `can0` or `vcan0` |
 | `bitrate` | arbitration-phase bit rate |
 | `dbitrate` | CAN FD data-phase bit rate. Must be non-zero |
-| `id` | **this** node, 0..=254, the source in every identifier it sends. Unique on the bus |
-| `peer` | 0..=254, the one node a unicast link talks to. Required to connect |
+| `id` | **this** node, 0..=253, the source in every identifier it sends. Unique on the bus. A zenoh-pico node that connects without one asks for one (see below) |
+| `peer` | 0..=253, the one node a unicast link talks to. Required to connect |
 | `so_rcvbuf` | receive buffer in bytes. Absent, the kernel default applies |
 | `mode` | on the locator, before `#`: `unicast` (default) or `multicast` |
 
@@ -77,7 +95,7 @@ The identifier is 29 bits, and carries the bus priority as well as the address:
 ```text
   28..26  priority   zenoh priority (0 = control ... 7 = background)
   25..21  key id     the sender's ExprId for the topic, 0 = none (not filled in yet)
-  20..16  reserved   zero
+  20..16  kind       0 = data, 1 = id request, 2 = id assign
   15..8   destination node, 0xFF = every node
    7..0   source node
 ```

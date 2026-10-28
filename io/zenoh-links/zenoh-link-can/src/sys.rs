@@ -367,7 +367,14 @@ impl CanSocket {
     /// link does; it is reported as sent so that it does not fail the transport
     /// over a transient condition.
     pub(crate) async fn send(&self, datagram: &[u8], dst: u8, priority: u8) -> ZResult<usize> {
-        let id = frame::make_id(priority, 0, dst, self.node);
+        self.send_with_id(datagram, frame::make_id(priority, 0, dst, self.node))
+            .await
+    }
+
+    /// [`send`](Self::send) under an identifier of the caller's making, as the
+    /// control messages need.
+    pub(crate) async fn send_with_id(&self, datagram: &[u8], id: u32) -> ZResult<usize> {
+        let dst = frame::id_dst(id);
 
         // One transfer at a time. The frames of two datagrams under the same
         // identifier would interleave and neither would reassemble, so the

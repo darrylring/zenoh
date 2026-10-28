@@ -618,11 +618,11 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        // 0xFF is everybody, so it cannot be a node.
+        // 0xFF is everybody and 0xFE has no id yet, so neither can be a node.
         let broadcast = multicast_endpoint(255, "");
         let err = ztimeout!(manager.open_transport_multicast(broadcast)).unwrap_err();
         assert!(
-            err.to_string().contains("0..=254"),
+            err.to_string().contains("0..=253"),
             "unexpected error: {err}"
         );
 

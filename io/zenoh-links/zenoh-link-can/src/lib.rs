@@ -34,11 +34,16 @@
 //!
 //! The wire format is the same for both and only the destination differs.
 //!
+//! A device that has no node id asks for one. A listening unicast link answers:
+//! see [`ids`] and the README.
+//!
 //! Frames are segmented and reassembled by the link itself, so it is a
 //! **datagram** link with a 4095-byte MTU, and zenoh's own fragmentation never
 //! runs on it. CAN FD is required: classic CAN is not supported.
 
 mod frame;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod ids;
 mod multicast;
 #[cfg(target_os = "linux")]
 mod sys;
@@ -79,9 +84,9 @@ const IFNAMSIZ: usize = 16;
 /// * `bitrate` -- arbitration-phase bit rate
 /// * `dbitrate` -- CAN FD data-phase bit rate. Must be non-zero: this link is
 ///   CAN FD only
-/// * `id` -- **this** node, 0..=254. It is the source in every identifier it
+/// * `id` -- **this** node, 0..=253. It is the source in every identifier it
 ///   sends, and node ids must be unique on the bus
-/// * `peer` -- 0..=254, the one node a unicast link talks to. Required to
+/// * `peer` -- 0..=253, the one node a unicast link talks to. Required to
 ///   connect, and not used to listen
 ///
 /// On Linux the bit rates are advisory: rates are set out of band with
@@ -214,14 +219,16 @@ fn get_opt_u32(endpoint: &EndPoint, key: &str) -> ZResult<Option<u32>> {
         .transpose()
 }
 
-/// A node id: 0..=254, since 0xFF is everybody.
+/// A node id: 0..=253, since 0xFF is everybody and 0xFE is a node without an id.
 fn node(key: &str, value: u32) -> ZResult<u8> {
     match u8::try_from(value) {
         Ok(n) if n <= frame::NODE_MAX => Ok(n),
         _ => bail!(
-            "CAN `{key}` is {value}, outside the node range 0..={}: {:#x} is the broadcast address",
+            "CAN `{key}` is {value}, outside the node range 0..={}: {:#x} is the broadcast \
+             address and {:#x} is a node that has no id yet",
             frame::NODE_MAX,
-            frame::NODE_BROADCAST
+            frame::NODE_BROADCAST,
+            frame::NODE_UNASSIGNED
         ),
     }
 }
@@ -407,16 +414,18 @@ mod tests {
     }
 
     #[test]
-    fn the_broadcast_address_is_not_a_node() {
+    fn the_broadcast_and_unassigned_addresses_are_not_nodes() {
         for s in [
             "can/vcan0#id=255",
+            "can/vcan0#id=254",
+            "can/vcan0#peer=254",
             "can/vcan0#id=0x100",
             "can/vcan0#peer=255",
         ] {
             let e = CanEndpoint::parse(&ep(s)).unwrap_err();
-            assert!(e.to_string().contains("0..=254"), "{s}: {e}");
+            assert!(e.to_string().contains("0..=253"), "{s}: {e}");
         }
-        assert!(CanEndpoint::parse(&ep("can/vcan0#id=254;peer=0")).is_ok());
+        assert!(CanEndpoint::parse(&ep("can/vcan0#id=253;peer=0")).is_ok());
     }
 
     #[test]
